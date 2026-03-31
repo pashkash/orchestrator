@@ -1,0 +1,133 @@
+version: "1.0"
+start_phase: collect
+end_phase: end
+
+phases:
+  - id: collect
+    description: "Сбор / обновление snapshot окружения"
+  - id: plan
+    description: "Построение / обновление DAG-плана"
+  - id: execute
+    description: "Выполнение subtasks плана"
+  - id: validate
+    description: "Кросс-проверка и merge"
+  - id: human_gate
+    description: "Ручные решения и уточнения пользователя"
+
+status_types:
+  - PASS
+  - NEEDS_INFO
+  - NEEDS_MORE_SNAPSHOT
+  - NEEDS_REPLAN
+  - NEEDS_FIX_EXECUTOR
+  - NEEDS_FIX_REVIEW
+  - NEEDS_FIX_TESTS
+  - ASK_HUMAN
+  - ESCALATE_TO_HUMAN
+  - BLOCKED
+
+transitions:
+  - from: collect
+    on_status: PASS
+    to: plan
+    reason: snapshot_ready
+  - from: collect
+    on_status: NEEDS_INFO
+    to: collect
+    reason: collector_requests_more_data
+  - from: collect
+    on_status: NEEDS_FIX_EXECUTOR
+    to: collect
+    reason: executor_guardrails_failed
+  - from: collect
+    on_status: NEEDS_FIX_REVIEW
+    to: collect
+    reason: reviewer_guardrails_failed
+  - from: collect
+    on_status: NEEDS_FIX_TESTS
+    to: collect
+    reason: tester_guardrails_failed
+
+  - from: plan
+    on_status: PASS
+    to: execute
+    reason: plan_ready
+  - from: plan
+    on_status: NEEDS_MORE_SNAPSHOT
+    to: collect
+    reason: planner_missing_snapshot_inputs
+  - from: plan
+    on_status: ASK_HUMAN
+    to: human_gate
+    reason: planner_requests_clarification
+  - from: plan
+    on_status: ESCALATE_TO_HUMAN
+    to: human_gate
+    reason: planner_detected_risk
+  - from: plan
+    on_status: NEEDS_FIX_EXECUTOR
+    to: plan
+    reason: planner_executor_guardrails_failed
+  - from: plan
+    on_status: NEEDS_FIX_REVIEW
+    to: plan
+    reason: planner_reviewer_guardrails_failed
+  - from: plan
+    on_status: NEEDS_FIX_TESTS
+    to: plan
+    reason: planner_tester_guardrails_failed
+
+  - from: execute
+    on_status: PASS
+    to: validate
+    reason: all_subtasks_passed
+  - from: execute
+    on_status: NEEDS_REPLAN
+    to: plan
+    reason: subtask_blocked_or_requires_new_plan
+  - from: execute
+    on_status: ESCALATE_TO_HUMAN
+    to: human_gate
+    reason: worker_escalated_risk
+
+  - from: validate
+    on_status: PASS
+    to: end
+    reason: validation_and_merge_success
+  - from: validate
+    on_status: NEEDS_REPLAN
+    to: plan
+    reason: cross_cutting_issues_require_new_plan
+  - from: validate
+    on_status: NEEDS_MORE_SNAPSHOT
+    to: collect
+    reason: validator_needs_more_snapshot_data
+  - from: validate
+    on_status: ASK_HUMAN
+    to: human_gate
+    reason: validator_requests_clarification
+  - from: validate
+    on_status: ESCALATE_TO_HUMAN
+    to: human_gate
+    reason: validator_detects_risk
+  - from: validate
+    on_status: NEEDS_FIX_EXECUTOR
+    to: validate
+    reason: validator_executor_guardrails_failed
+  - from: validate
+    on_status: NEEDS_FIX_REVIEW
+    to: validate
+    reason: validator_reviewer_guardrails_failed
+  - from: validate
+    on_status: NEEDS_FIX_TESTS
+    to: validate
+    reason: validator_tester_guardrails_failed
+
+  - from: human_gate
+    on_status: PASS
+    to: plan
+    reason: user_provided_clarification_or_approval
+  - from: human_gate
+    on_status: BLOCKED
+    to: end
+    reason: user_froze_or_cancelled_task

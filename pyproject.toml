@@ -1,0 +1,23 @@
+[project]
+name = "squadder-orchestrator"
+version = "0.1.0"
+description = "Multi-agent orchestrator: LangGraph state machine + OpenHands workers"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "langgraph>=0.4",
+    "langgraph-checkpoint-sqlite>=2.0",
+    "langchain-openai>=0.3",
+    "pyyaml>=6.0",
+    "pydantic>=2.0",
+    "httpx>=0.28.1",
+    "openhands-agent-server>=1.16.0",
+    "openhands-sdk>=1.16.0",
+    "openhands-tools>=1.16.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.25",
+]

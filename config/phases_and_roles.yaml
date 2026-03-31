@@ -1,0 +1,136 @@
+runtime:
+  docs_root_alias: "Technical Docs"
+  docs_root_default: "/root/squadder-devops/docs"
+  prompts_root: "Technical Docs/common/roles"
+  workspace_root_default: "/root/squadder-devops"
+  tasks_root_default: "/root/management-stage/task-history"
+  openhands:
+    base_url_env: "OPENHANDS_BASE_URL"
+    llm_api_key_env: "OPENROUTER_API_KEY"
+    llm_base_url: "https://openrouter.ai/api/v1"
+    poll_interval_seconds: 2
+    timeout_seconds: 180
+    cli_mode: true
+    tools:
+      - "terminal"
+      - "file_editor"
+
+phases:
+  collect:
+    phase: collect
+    role_dir: collector
+    description: "Сбор и обновление snapshot окружения"
+    pipeline:
+      executor:
+        role_dir: collector
+        prompt:
+          sub_role: executor
+          path: "Technical Docs/common/roles/collector/executor.md"
+        model: "openhands/claude-sonnet-4-5-20250929"
+        max_retries: 2
+        guardrails:
+          - ensure_required_fields
+          - ensure_non_empty_payload
+      reviewer:
+        role_dir: collector
+        prompt:
+          sub_role: reviewer
+          path: "Technical Docs/common/roles/collector/reviewer.md"
+        model: "openhands/claude-sonnet-4-5-20250929"
+        max_retries: 1
+        guardrails:
+          - ensure_status_field
+          - ensure_feedback_field
+      tester: null
+
+  plan:
+    phase: plan
+    role_dir: supervisor
+    description: "Построение и обновление mutable DAG-плана"
+    pipeline:
+      executor:
+        role_dir: supervisor
+        prompt:
+          sub_role: executor
+          path: "Technical Docs/common/roles/supervisor/executor.md"
+        model: "openhands/claude-sonnet-4-5-20250929"
+        max_retries: 2
+        guardrails:
+          - ensure_required_fields
+          - ensure_plan_payload
+      reviewer:
+        role_dir: supervisor
+        prompt:
+          sub_role: reviewer
+          path: "Technical Docs/common/roles/supervisor/reviewer.md"
+        model: "openhands/claude-sonnet-4-5-20250929"
+        max_retries: 1
+        guardrails:
+          - ensure_status_field
+          - ensure_feedback_field
+      tester: null
+
+  execute:
+    phase: execute
+    description: "Последовательное выполнение subtasks плана"
+    strategy:
+      type: planner_driven
+      max_concurrent: 1
+    default_worker_pipeline:
+      executor:
+        role_dir: "{role_dir}"
+        prompt:
+          sub_role: executor
+          path: "Technical Docs/common/roles/{role_dir}/executor.md"
+        model: "openhands/claude-sonnet-4-5-20250929"
+        max_retries: 3
+        guardrails:
+          - ensure_structured_output
+          - ensure_checklist
+      reviewer:
+        role_dir: "{role_dir}"
+        prompt:
+          sub_role: reviewer
+          path: "Technical Docs/common/roles/{role_dir}/reviewer.md"
+        model: "openhands/claude-sonnet-4-5-20250929"
+        max_retries: 2
+        guardrails:
+          - ensure_status_field
+          - ensure_feedback_field
+      tester:
+        role_dir: "{role_dir}"
+        prompt:
+          sub_role: tester
+          path: "Technical Docs/common/roles/{role_dir}/tester.md"
+        model: "openhands/gpt-5-mini-2025-08-07"
+        max_retries: 1
+        guardrails:
+          - ensure_status_field
+          - ensure_tests_summary
+
+  validate:
+    phase: validate
+    role_dir: supervisor
+    description: "Кросс-проверка merged результатов"
+    pipeline:
+      executor:
+        role_dir: supervisor
+        prompt:
+          sub_role: executor
+          path: "Technical Docs/common/roles/supervisor/executor.md"
+        model: "openhands/claude-sonnet-4-5-20250929"
+        max_retries: 1
+        guardrails:
+          - ensure_required_fields
+          - ensure_validate_payload
+      reviewer:
+        role_dir: supervisor
+        prompt:
+          sub_role: reviewer
+          path: "Technical Docs/common/roles/supervisor/reviewer.md"
+        model: "openhands/claude-sonnet-4-5-20250929"
+        max_retries: 1
+        guardrails:
+          - ensure_status_field
+          - ensure_feedback_field
+      tester: null
