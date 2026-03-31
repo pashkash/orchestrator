@@ -1,6 +1,6 @@
-# Squadder Orchestrator
+# Orchestrator
 
-Phase-driven V1 orchestrator for Squadder:
+Phase-driven V1 orchestrator:
 
 - top-level control flow lives in LangGraph
 - runtime graph shape lives in `orchestrator/config/`
