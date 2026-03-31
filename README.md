@@ -1,60 +1,251 @@
-# Orchestrator
+# Workflow Runtime
 
-Phase-driven V1 orchestrator:
+## Why this project exists
 
-- top-level control flow lives in LangGraph
-- runtime graph shape lives in `orchestrator/config/`
-- role knowledge and prompts live in `docs/common/roles/`
-- worker execution can run through `MockDriver` or `OpenHandsDriver`
+This workflow runtime automates AI agent work across the full software engineering pipeline: collecting context, planning, executing, and validating, while enforcing strict quality standards so output quality does not degrade as work scales.
 
-## V1 Architecture
+Uncontrolled LLM execution tends to produce inconsistent results. This runtime counters that with a **closed-loop architecture**: every AI step is followed by automated guardrails and an independent AI reviewer. The reviewer catches mistakes the executor missed; guardrails enforce structural contracts. Failed steps retry or escalate to humans—never silently pass. The same **triple-check pattern** (executor → guardrails → reviewer, with optional tester and further guardrails) runs for every phase, so enforcement is systematic rather than ad hoc.
 
-```text
-collect -> plan -> execute -> validate -> human_gate
+At the top level, control flow is implemented in **LangGraph**; phase topology and pipelines are driven by YAML under `orchestrator/config/`; role knowledge and prompts live under `docs/common/roles/`. Worker calls go through **`MockDriver`** (tests, dry-runs) or **`OpenHandsDriver`** (live agent server).
+
+## Phase flow (top-level graph)
+
+```mermaid
+graph LR
+    START --> collect
+    collect -->|PASS| plan
+    collect -->|NEEDS_INFO| collect
+    collect -->|NEEDS_FIX_EXECUTOR| collect
+    collect -->|NEEDS_FIX_REVIEW| collect
+    collect -->|NEEDS_FIX_TESTS| collect
+    plan -->|PASS| execute
+    plan -->|NEEDS_MORE_SNAPSHOT| collect
+    plan -->|ASK_HUMAN| human_gate
+    plan -->|ESCALATE_TO_HUMAN| human_gate
+    plan -->|NEEDS_FIX_EXECUTOR| plan
+    plan -->|NEEDS_FIX_REVIEW| plan
+    plan -->|NEEDS_FIX_TESTS| plan
+    execute -->|PASS| validate
+    execute -->|NEEDS_REPLAN| plan
+    execute -->|ESCALATE_TO_HUMAN| human_gate
+    validate -->|PASS| END
+    validate -->|NEEDS_REPLAN| plan
+    validate -->|NEEDS_MORE_SNAPSHOT| collect
+    validate -->|ASK_HUMAN| human_gate
+    validate -->|ESCALATE_TO_HUMAN| human_gate
+    validate -->|NEEDS_FIX_EXECUTOR| validate
+    validate -->|NEEDS_FIX_REVIEW| validate
+    validate -->|NEEDS_FIX_TESTS| validate
+    human_gate -->|PASS| plan
+    human_gate -->|BLOCKED| END
 ```
 
-The graph is intentionally static at the phase level. Dynamic behavior lives in two places:
+## Universal TaskUnit pipeline
 
-1. `PipelineState.plan` stores a mutable list of `SubtaskState`
-2. `execute` runs a universal `TaskUnit` sequentially over ready subtasks
+Each phase uses the same reusable **TaskUnit**. In the implemented runtime, guardrails run after **every AI-producing step**: after the executor, after the reviewer, and after the tester when a tester is enabled. Dynamic plan shape is carried in `PipelineState.plan` (`SubtaskState` list), and **execute** runs TaskUnits over ready subtasks in order. The runtime retries only the **executor** inside the TaskUnit; reviewer and tester failures return immediately as `NEEDS_FIX_REVIEW` or `NEEDS_FIX_TESTS`. The first diagram below shows the main roles; the second shows the exact guardrail checkpoints and status exits.
 
-`TaskUnit` is the reusable pipeline used by `collect`, `plan`, `execute`, and `validate`:
-
-```text
-executor -> simple guardrails -> reviewer -> simple guardrails -> tester? -> simple guardrails
+```mermaid
+flowchart LR
+    Phase[Phase Wrapper] --> Exec[Executor AI]
+    Exec --> Rev[Reviewer AI]
+    Rev -->|tester enabled| Test[Tester AI]
+    Rev -->|tester disabled| Result[PASS + StructuredOutput]
+    Test --> Result
 ```
 
-## Sources Of Truth
+```mermaid
+sequenceDiagram
+    participant Phase as Phase Wrapper
+    participant Exec as Executor (AI)
+    participant GR1 as Guardrails after executor
+    participant Rev as Reviewer (AI)
+    participant GR2 as Guardrails after reviewer
+    participant Test as Tester (AI)
+    participant GR3 as Guardrails after tester
 
-Runtime source of truth:
+    loop Executor retries while max_retries not exhausted
+        Phase->>Exec: run(prompt, context)
+        Exec-->>Phase: executor_result
+        Phase->>GR1: validate(executor_result)
+        alt Executor accepted
+            GR1-->>Phase: PASS
+        else Executor failed guardrails
+            GR1-->>Phase: NEEDS_FIX_EXECUTOR
+        end
+    end
 
-- `orchestrator/config/flow.yaml`
-- `orchestrator/config/phases_and_roles.yaml`
+    alt Executor still failed or returned a blocking status
+        Phase-->>Phase: return NEEDS_FIX_EXECUTOR / BLOCKED / ESCALATE_TO_HUMAN
+    else Executor passed
+        Phase->>Rev: review(executor_payload)
+        Rev-->>Phase: review_result
+        Phase->>GR2: validate(review_result)
+        alt Reviewer failed guardrails
+            GR2-->>Phase: NEEDS_FIX_REVIEW
+            Phase-->>Phase: return NEEDS_FIX_REVIEW
+        else Reviewer passed
+            opt Tester enabled
+                Phase->>Test: test(executor_payload)
+                Test-->>Phase: test_result
+                Phase->>GR3: validate(test_result)
+                alt Tester failed guardrails
+                    GR3-->>Phase: NEEDS_FIX_TESTS
+                    Phase-->>Phase: return NEEDS_FIX_TESTS
+                else Tester passed
+                    GR3-->>Phase: PASS
+                end
+            end
+            Phase-->>Phase: PASS + StructuredOutput
+        end
+    end
+```
 
-Human-readable design / knowledge source:
+## Sources of truth
 
-- `docs/common/roles/flow_design.md`
-- `docs/common/roles/{role}/role.yaml`
-- `docs/common/roles/{role}/{executor,reviewer,tester}.md`
-- `docs/common/roles/_shared/*.md`
+**Runtime manifests**
 
-Task artifacts used during this refactor:
+- `orchestrator/config/flow.yaml` — phase graph, statuses, transitions  
+- `orchestrator/config/phases_and_roles.yaml` — per-phase pipelines, models, retries, guardrails, OpenHands transport  
 
-- `management-stage/task-history/2026-03-24_1800__multi-agent-system-design/TASK.md`
-- `management-stage/task-history/2026-03-24_1800__multi-agent-system-design/phase2-v1-orchestrator-refactor.md`
-- `management-stage/task-history/2026-03-24_1800__multi-agent-system-design/phase2-langgraph-skeleton.md` (historical only)
+**Human-readable design and prompts**
 
-## Package Layout
+- `docs/common/roles/flow_design.md`  
+- `docs/common/roles/{role}/role.yaml`  
+- `docs/common/roles/{role}/{executor,reviewer,tester}.md`  
+- `docs/common/roles/_shared/*.md`  
+
+Prompt and design-document locations are resolved from `config/phases_and_roles.yaml`.
+
+**Design artifacts (V1 chain)**
+
+`TASK.md` / design notes → `orchestrator/config/*` → Python phase interpreter.
+
+| Artifact | What it describes | Path |
+|----------|-------------------|------|
+| **TASK.md** | V1 decisions, state schema intent, evidence | `management-stage/task-history/2026-03-24_1800__multi-agent-system-design/TASK.md` |
+| **phase2-v1 subtask** | Implementation lane, structured output, evidence | `management-stage/task-history/2026-03-24_1800__multi-agent-system-design/phase2-v1-orchestrator-refactor.md` |
+| **flow.yaml** | Runtime phase topology, statuses, transitions | `orchestrator/config/flow.yaml` |
+| **phases_and_roles.yaml** | Runtime pipelines, prompts, retries, OpenHands settings | `orchestrator/config/phases_and_roles.yaml` |
+| **flow_design.md** | Human-readable V1 rationale aligned with manifests | `docs/common/roles/flow_design.md` |
+| **task framework reference** | English translations of task artifacts and worktree model | `orchestrator/reference_artifacts/task_framework/README.md` |
+| **phase2-langgraph-skeleton** | Historical pre-V1 reference only | `management-stage/task-history/2026-03-24_1800__multi-agent-system-design/phase2-langgraph-skeleton.md` |
+
+Reference translations for the task framework:
+
+- `orchestrator/reference_artifacts/task_framework/task_template.en.md`
+- `orchestrator/reference_artifacts/task_framework/task_management.en.md`
+- `orchestrator/reference_artifacts/task_framework/README.md`
+
+## YAML examples
+
+Representative excerpts from the actual runtime manifests:
+
+### `config/flow.yaml`
+
+```yaml
+version: "1.0"
+start_phase: collect
+end_phase: end
+
+phases:
+  - id: collect
+  - id: plan
+  - id: execute
+  - id: validate
+  - id: human_gate
+
+status_types:
+  - PASS
+  - NEEDS_INFO
+  - NEEDS_MORE_SNAPSHOT
+  - NEEDS_REPLAN
+  - NEEDS_FIX_EXECUTOR
+  - NEEDS_FIX_REVIEW
+  - NEEDS_FIX_TESTS
+  - ASK_HUMAN
+  - ESCALATE_TO_HUMAN
+  - BLOCKED
+
+transitions:
+  - from: collect
+    on_status: PASS
+    to: plan
+    reason: snapshot_ready
+  - from: execute
+    on_status: NEEDS_REPLAN
+    to: plan
+    reason: subtask_blocked_or_requires_new_plan
+  - from: human_gate
+    on_status: BLOCKED
+    to: end
+    reason: user_froze_or_cancelled_task
+```
+
+### `config/phases_and_roles.yaml`
+
+```yaml
+runtime:
+  docs_root_alias: "Technical Docs"
+  prompts_root: "Technical Docs/common/roles"
+  openhands:
+    base_url_env: "OPENHANDS_BASE_URL"
+    llm_api_key_env: "OPENROUTER_API_KEY"
+    tools:
+      - "terminal"
+      - "file_editor"
+
+phases:
+  execute:
+    phase: execute
+    strategy:
+      type: planner_driven
+      max_concurrent: 1
+    default_worker_pipeline:
+      executor:
+        role_dir: "{role_dir}"
+        prompt:
+          sub_role: executor
+          path: "Technical Docs/common/roles/{role_dir}/executor.md"
+        model: "openhands/claude-sonnet-4-5-20250929"
+        max_retries: 3
+        guardrails:
+          - ensure_structured_output
+          - ensure_checklist
+      reviewer:
+        role_dir: "{role_dir}"
+        prompt:
+          sub_role: reviewer
+          path: "Technical Docs/common/roles/{role_dir}/reviewer.md"
+        model: "openhands/claude-sonnet-4-5-20250929"
+        max_retries: 2
+        guardrails:
+          - ensure_status_field
+          - ensure_feedback_field
+      tester:
+        role_dir: "{role_dir}"
+        prompt:
+          sub_role: tester
+          path: "Technical Docs/common/roles/{role_dir}/tester.md"
+        model: "openhands/gpt-5-mini-2025-08-07"
+        max_retries: 1
+        guardrails:
+          - ensure_status_field
+          - ensure_tests_summary
+```
+
+## Package layout
 
 ```text
 orchestrator/
 ├── config/
 │   ├── flow.yaml
 │   └── phases_and_roles.yaml
-├── squadder_orchestrator/
-│   ├── graph.py                         # compatibility entrypoint -> V1 compiler
-│   ├── config.py                        # compatibility loaders -> V1 manifests
-│   ├── state.py                         # compatibility aliases -> PipelineState/SubtaskState
+├── reference_artifacts/
+│   └── task_framework/
+│       ├── README.md
+│       ├── task_management.en.md
+│       └── task_template.en.md
+├── workflow_runtime/
 │   ├── graph_compiler/
 │   │   ├── state_schema.py
 │   │   ├── yaml_manifest_parser.py
@@ -81,6 +272,7 @@ orchestrator/
 │   └── integrations/
 │       ├── observability.py
 │       ├── openhands_http_api.py
+│       ├── openhands_runtime.py
 │       ├── phase_config_loader.py
 │       ├── prompt_composer.py
 │       └── tasks_storage.py
@@ -93,229 +285,49 @@ orchestrator/
     └── test_openhands_runtime.py
 ```
 
-## Main Runtime Types
+## Main runtime types
 
-- `PipelineState`: full state of one orchestrator run
-- `SubtaskState`: one mutable plan item
-- `StructuredOutput`: required executor result contract
-- `TaskUnitResult`: normalized output of the universal task unit
+- **`PipelineState`** — full state of one orchestrator run  
+- **`SubtaskState`** — one mutable plan item  
+- **`StructuredOutput`** — required executor result contract  
+- **`TaskUnitResult`** — normalized output of the universal TaskUnit  
 
-Compatibility aliases are kept:
+## Driver modes
 
-- `AgentState = PipelineState`
-- `Subtask = SubtaskState`
+- **`mock`** — deterministic local driver for tests and dry-runs  
+- **`openhands`** — OpenHands Agent Server via `OpenHandsHttpApi`  
 
-## Driver Modes
+`compile_graph()` resolves the driver in this order: explicit `driver=` → explicit `driver_mode=` → env `WORKFLOW_RUNTIME_DRIVER_MODE` → default **`mock`**.
 
-Supported runtime modes:
+### OpenHands notes
 
-- `mock`: deterministic local driver for tests and dry-runs
-- `openhands`: real OpenHands Agent Server via `OpenHandsHttpApi`
+Integration is exercised against **openhands-agent-server v1.16**. Verified: conversation creation, `run`, polling conversation state, event search when `limit <= 100`, YAML payload normalization via `OpenHandsDriver`, and code-capable runs with **`tools: ["terminal", "file_editor"]`**.
 
-`compile_graph()` chooses the driver in this order:
-
-1. explicit `driver=...`
-2. explicit `driver_mode=...`
-3. env `SQUADDER_ORCHESTRATOR_DRIVER_MODE`
-4. fallback `mock`
-
-## OpenHands Notes
-
-The current V1 integration is verified against local `openhands-agent-server v1.16`.
-
-Verified behavior:
-
-- conversation creation works
-- `run` works
-- polling conversation state works
-- event search works when `limit <= 100`
-- YAML payload normalization works through `OpenHandsDriver`
-
-Important runtime note:
-
-- `runtime.openhands.tools` is currently `[]`
-- local `openhands-agent-server v1.16` returned `KeyError: ToolDefinition 'TerminalTool' is not registered` when `TerminalTool` / `FileEditorTool` were requested directly
-- because of that, the verified smoke path uses tool-less conversations for now
-
-This keeps the OpenHands integration honest and runnable, but it also means that real code-edit execution through the local agent server still needs a separate tool-registration pass.
+Registered tool names in this stack are **`terminal`** and **`file_editor`**. Class-like names (e.g. `TerminalTool`, `FileEditorTool`) are not valid for the registry and produced `KeyError`-style failures; `orchestrator/config/phases_and_roles.yaml` uses the real names, and `tests/test_openhands_runtime.py` guards against regressions. No empty `tools: []` workaround is required for the local V1 path.
 
 ## Setup
 
 ```bash
-cd /root/squadder-devops/orchestrator
+cd orchestrator
 uv sync
 ```
 
-For real OpenHands runtime:
+For a live OpenHands server (example):
 
 ```bash
 export OPENHANDS_BASE_URL="http://127.0.0.1:8000"
 export OPENROUTER_API_KEY="<secret>"
-```
+export WORKFLOW_RUNTIME_DRIVER_MODE="openhands"   # optional; default is mock
 
-Optional driver selection:
-
-```bash
-export SQUADDER_ORCHESTRATOR_DRIVER_MODE="openhands"
-```
-
-## Running Tests
-
-```bash
-uv run pytest tests/ -v
-```
-
-Current test coverage verifies:
-
-- happy-path V1 mock execution
-- dependency-aware sequential `execute`
-- manifest loading
-- prompt composition
-- human gate interrupt/resume
-- SQLite checkpoint persistence
-- OpenHands YAML payload normalization
-
-## Real Smoke Evidence
-
-Verified locally during this task:
-
-- local `openhands.agent_server` started successfully on `127.0.0.1:8000`
-- real `OpenHandsDriver` request against the live server returned:
-
-```text
-{'status': 'PASS', 'conversation_id': '65fec569-cc72-4a2c-ac25-0ac5b1828822', 'summary': 'OpenHands smoke test ok'}
-```
-
-The smoke run used:
-
-- `OpenHandsHttpApi`
-- `OpenHandsDriver`
-- OpenRouter base URL
-- `tools=[]` due the server-side registry limitation described above
-
-## What Changed From Pre-V1
-
-Pre-V1 / historical design:
-
-- docs-based generic YAML graph builder
-- registry-driven node graph
-- subgraph fan-out as the primary execution primitive
-
-Current V1 design:
-
-- phase-driven top-level graph
-- mutable plan as runtime control surface
-- universal `TaskUnit`
-- runtime config moved into `orchestrator/config/`
-- OpenHands wired as a driver layer, not as graph structure
-
-## Design Artifacts
-
-The current V1 chain is:
-
-`TASK.md` / design decisions -> `orchestrator/config/*` runtime manifests -> Python phase interpreter
-
-| Артефакт | Что описывает | Путь |
-|----------|--------------|------|
-| **TASK.md** | Current V1 decisions, state schema intent, evidence | `management-stage/task-history/2026-03-24_1800__multi-agent-system-design/TASK.md` |
-| **phase2-v1 subtask** | Implementation lane, structured output, evidence | `management-stage/task-history/2026-03-24_1800__multi-agent-system-design/phase2-v1-orchestrator-refactor.md` |
-| **flow.yaml** | Runtime phase topology, statuses, transitions | `orchestrator/config/flow.yaml` |
-| **phases_and_roles.yaml** | Runtime pipelines, prompts, retries, OpenHands settings | `orchestrator/config/phases_and_roles.yaml` |
-| **flow_design.md** | Human-readable V1 design rationale synced with runtime manifests | `docs/common/roles/flow_design.md` |
-| **phase2-langgraph-skeleton** | Historical pre-V1 artifact only | `management-stage/task-history/2026-03-24_1800__multi-agent-system-design/phase2-langgraph-skeleton.md` |
-
-## Configuration
-
-The orchestrator reads runtime configuration from `orchestrator/config/`:
-
-| File | Purpose |
-|------|---------|
-| `flow.yaml` | Phase graph: `collect -> plan -> execute -> validate -> human_gate`, statuses, transitions |
-| `phases_and_roles.yaml` | Phase pipelines, model config, retries, guardrails, OpenHands transport settings |
-| `{role}/executor.md` | Executor prompt in `docs/common/roles/` |
-| `{role}/reviewer.md` | Reviewer prompt in `docs/common/roles/` |
-| `{role}/tester.md` | Optional tester prompt in `docs/common/roles/` |
-| `_shared/*.md` | Shared prompt fragments for domain roles |
-
-Set `SQUADDER_DOCS_ROOT` env var to override docs path (default: `/root/squadder-devops/docs`).
-
-## OpenHands Notes
-
-The current V1 integration is verified against local `openhands-agent-server v1.16`.
-
-Verified behavior:
-
-- conversation creation works
-- `run` works
-- polling conversation state works
-- event search works when `limit <= 100`
-- YAML payload normalization works through `OpenHandsDriver`
-- code-edit-capable conversations work with `tools: ["terminal", "file_editor"]`
-
-Important runtime note:
-
-- the earlier failure was **not** a broken server-side registry
-- the problem was an incorrect tool spec: we sent `TerminalTool` / `FileEditorTool`
-- in installed `openhands v1.16`, the actual registered tool names are `terminal` and `file_editor`
-- `orchestrator/config/phases_and_roles.yaml` now uses those real names
-- `tests/test_openhands_runtime.py` locks this assumption against regressions
-
-This means no `tools: []` workaround is needed anymore for the local V1 runtime path.
-
-## Setup
-
-```bash
-cd /root/squadder-devops/orchestrator
-uv sync
-export OPENHANDS_BASE_URL="http://127.0.0.1:8000"
-export OPENROUTER_API_KEY="<secret>"
 uv run python -m openhands.agent_server --host 127.0.0.1 --port 8000
 ```
 
-Optional driver selection:
+Adjust host/port to match `OPENHANDS_BASE_URL`.
 
-```bash
-export SQUADDER_ORCHESTRATOR_DRIVER_MODE="openhands"
-```
-
-## Running Tests
+## Running tests
 
 ```bash
 uv run pytest tests/ -v
 ```
 
-Current test coverage verifies:
-
-- happy-path V1 mock execution
-- dependency-aware sequential `execute`
-- manifest loading
-- prompt composition
-- human gate interrupt/resume
-- SQLite checkpoint persistence
-- OpenHands YAML payload normalization
-- OpenHands tool-name contract for the installed SDK/runtime
-
-## Real Smoke Evidence
-
-Verified locally during this task:
-
-- stock `uv run python -m openhands.agent_server --host 127.0.0.1 --port 8011` started successfully
-- real `OpenHandsDriver` request against the live server returned:
-
-```text
-{'status': 'PASS', 'conversation_id': '7ce2ef08-c0f8-47d9-abfe-2b0a42ebf216', 'summary': 'tool smoke ok'}
-```
-
-The smoke run used:
-
-- `OpenHandsHttpApi`
-- `OpenHandsDriver`
-- OpenRouter base URL
-- `tools=["terminal", "file_editor"]`
-
-## Historical Notes
-
-Historical pre-V1 artifacts are kept only for traceability:
-
-- `phase2-langgraph-skeleton.md` remains a pre-V1 implementation artifact
-- the active design/runtime contract is now synchronized across `orchestrator/config/*`, `docs/common/roles/flow.yaml`, and `docs/common/roles/flow_design.md`
+Coverage includes: happy-path mock V1 run, dependency-aware sequential execute, manifest loading, prompt composition, human-gate interrupt/resume, SQLite checkpoints, OpenHands YAML normalization, and the OpenHands tool-name contract for the installed SDK/runtime.

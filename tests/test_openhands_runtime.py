@@ -5,7 +5,7 @@ from __future__ import annotations
 from openhands.tools.file_editor import FileEditorTool
 from openhands.tools.terminal import TerminalTool
 
-from squadder_orchestrator.integrations.openhands_runtime import (
+from workflow_runtime.integrations.openhands_runtime import (
     OPENHANDS_REQUIRED_TOOL_NAMES,
 )
 

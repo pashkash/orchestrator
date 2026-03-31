@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from squadder_orchestrator.agent_drivers.base_driver import DriverRequest
-from squadder_orchestrator.agent_drivers.openhands_driver import OpenHandsDriver
-from squadder_orchestrator.graph_compiler.state_schema import PhaseId, PipelineStatus, SubRole
-from squadder_orchestrator.integrations.openhands_http_api import OpenHandsConversationHandle
-from squadder_orchestrator.integrations.openhands_runtime import (
+from workflow_runtime.agent_drivers.base_driver import DriverRequest
+from workflow_runtime.agent_drivers.openhands_driver import OpenHandsDriver
+from workflow_runtime.graph_compiler.state_schema import PhaseId, PipelineStatus, SubRole
+from workflow_runtime.integrations.openhands_http_api import OpenHandsConversationHandle
+from workflow_runtime.integrations.openhands_runtime import (
     OPENHANDS_REQUIRED_TOOL_NAMES,
 )
 

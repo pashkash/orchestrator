@@ -1,1 +1,0 @@
-{"id":"bd9dc027-e6c3-4b84-b9d7-c604883f4564","timestamp":"2026-03-31T01:21:13.574341","source":"environment","code":"LLMBadRequestError","detail":"litellm.BadRequestError: Litellm_proxyException - claude-sonnet-4-5-20250929 is not a valid model ID","kind":"ConversationErrorEvent"}

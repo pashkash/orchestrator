@@ -5,10 +5,16 @@ from __future__ import annotations
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Command
 
-from squadder_orchestrator.agent_drivers.base_driver import DriverResult
-from squadder_orchestrator.agent_drivers.mock_driver import MockDriver
-from squadder_orchestrator.config import build_prompt, load_all_roles, load_flow, load_runtime
-from squadder_orchestrator.graph import compile_graph
+from workflow_runtime.agent_drivers.base_driver import DriverResult
+from workflow_runtime.agent_drivers.mock_driver import MockDriver
+from workflow_runtime.graph_compiler.langgraph_builder import compile_graph
+from workflow_runtime.graph_compiler.state_schema import PhaseId
+from workflow_runtime.integrations.phase_config_loader import (
+    get_flow_manifest,
+    get_runtime_config,
+    load_all_role_metadata,
+)
+from workflow_runtime.integrations.prompt_composer import compose_prompt
 from tests.mocks import ScriptedDriver
 
 
@@ -33,7 +39,7 @@ def test_execute_respects_dependencies(initial_state):
 
 
 def test_graph_nodes_match_runtime_manifest():
-    flow = load_flow()
+    flow = get_flow_manifest()
     app = compile_graph(driver=MockDriver())
 
     graph_nodes = {name for name in app.get_graph().nodes.keys() if not name.startswith("__")}
@@ -42,9 +48,9 @@ def test_graph_nodes_match_runtime_manifest():
 
 
 def test_runtime_loaders_reflect_v1_defaults():
-    roles = load_all_roles()
-    runtime = load_runtime()
-    flow = load_flow()
+    roles = load_all_role_metadata()
+    runtime = get_runtime_config()
+    flow = get_flow_manifest()
 
     assert "devops" in roles
     assert "collector" in roles
@@ -54,7 +60,13 @@ def test_runtime_loaders_reflect_v1_defaults():
 
 
 def test_prompt_builder_reads_shared_and_runtime_contract():
-    prompt = build_prompt("devops", "executor")
+    runtime = get_runtime_config()
+    prompt = compose_prompt(
+        phase_id=PhaseId.EXECUTE,
+        role_dir="devops",
+        step_config=runtime.phases["execute"].default_worker_pipeline.executor,
+        task_context={},
+    )
     assert "Runtime Task Context" in prompt
     assert "Output Contract" in prompt
 

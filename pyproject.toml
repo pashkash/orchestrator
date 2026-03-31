@@ -1,5 +1,5 @@
 [project]
-name = "squadder-orchestrator"
+name = "workflow-runtime"
 version = "0.1.0"
 description = "Multi-agent orchestrator: LangGraph state machine + OpenHands workers"
 readme = "README.md"
