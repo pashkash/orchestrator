@@ -2,16 +2,38 @@
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 from workflow_runtime.graph_compiler.state_schema import StructuredOutput, SubtaskState, SubtaskStatus
 from workflow_runtime.integrations.observability import ensure_trace_id
+from workflow_runtime.integrations.runtime_logging import get_logger
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
+# SEM_BEGIN orchestrator_v1.status_aggregation.get_ready_subtasks:v1
+# type: METHOD
+# use_case: Selects subtasks whose dependencies are already completed and are ready for execution.
+# feature:
+#   - Execute phase in V1 is sequential, so readiness must be recomputed from the mutable plan on each loop
+# pre:
+#   - plan contains SubtaskState items from the current mutable plan
+# post:
+#   - returns pending subtasks whose dependencies are all done
+# invariant:
+#   - plan is not mutated
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   -
+# depends:
+#   - SubtaskStatus
+# sft: compute ready subtasks from a mutable plan by checking completed dependencies
+# idempotent: true
+# logs: -
 def get_ready_subtasks(plan: list[SubtaskState]) -> list[SubtaskState]:
     completed = {subtask.id for subtask in plan if subtask.status == SubtaskStatus.DONE}
     ready: list[SubtaskState] = []
@@ -23,8 +45,36 @@ def get_ready_subtasks(plan: list[SubtaskState]) -> list[SubtaskState]:
     return ready
 
 
+# SEM_END orchestrator_v1.status_aggregation.get_ready_subtasks:v1
+
+
+# SEM_BEGIN orchestrator_v1.status_aggregation.has_incomplete_subtasks:v1
+# type: METHOD
+# use_case: Checks whether the current plan still contains pending or running work.
+# feature:
+#   - Execute phase needs to distinguish a completed plan from a deadlocked plan with no ready subtasks
+# pre:
+#   -
+# post:
+#   - returns true when the plan still has pending or in-progress subtasks
+# invariant:
+#   - plan is not mutated
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   -
+# depends:
+#   - SubtaskStatus
+# sft: detect whether a mutable plan still contains incomplete subtasks
+# idempotent: true
+# logs: -
 def has_incomplete_subtasks(plan: list[SubtaskState]) -> bool:
     return any(subtask.status in {SubtaskStatus.PENDING, SubtaskStatus.IN_PROGRESS} for subtask in plan)
+
+
+# SEM_END orchestrator_v1.status_aggregation.has_incomplete_subtasks:v1
 
 
 # SEM_BEGIN orchestrator_v1.status_aggregation.merge_structured_outputs:v1

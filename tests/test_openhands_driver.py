@@ -24,7 +24,7 @@ class FakeOpenHandsApi:
     def wait_until_finished(self, conversation_id, *, trace_id=None):  # noqa: ANN001
         return {"execution_status": "FINISHED"}
 
-    def search_events(self, conversation_id, limit=200):  # noqa: ANN001
+    def search_events(self, conversation_id, limit=200, *, trace_id=None):  # noqa: ANN001
         return {
             "events": [
                 {

@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
-import logging
-
 from workflow_runtime.graph_compiler.state_schema import PhaseId, PipelineState, PipelineStatus
 from workflow_runtime.graph_compiler.yaml_manifest_parser import PhaseRuntimeConfig
 from workflow_runtime.integrations.observability import ensure_trace_id
+from workflow_runtime.integrations.runtime_logging import get_logger
 from workflow_runtime.node_implementations.status_aggregation import merge_structured_outputs
 from workflow_runtime.node_implementations.task_unit import TaskUnitRunner
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 # SEM_BEGIN orchestrator_v1.validate_phase.run_validate_phase:v1

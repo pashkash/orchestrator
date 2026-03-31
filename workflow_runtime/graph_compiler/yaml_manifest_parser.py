@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -10,17 +9,66 @@ import yaml
 
 from workflow_runtime.graph_compiler.state_schema import PhaseId, PipelineStatus, SubRole
 from workflow_runtime.integrations.observability import ensure_trace_id
+from workflow_runtime.integrations.runtime_logging import get_logger
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
+# SEM_BEGIN orchestrator_v1.yaml_manifest_parser.phase_spec:v1
+# type: CLASS
+# use_case: Typed description of one top-level phase declared in flow.yaml.
+# feature:
+#   - Graph compilation should consume typed phase specs instead of raw YAML dicts
+# pre:
+#   -
+# post:
+#   -
+# invariant:
+#   - id matches one PhaseId used in the compiled graph
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   -
+# depends:
+#   - PhaseId
+# sft: define typed phase specification record loaded from flow manifest
+# idempotent: -
+# logs: -
 @dataclass(frozen=True, slots=True)
 class PhaseSpec:
     id: PhaseId
     description: str
 
 
+# SEM_END orchestrator_v1.yaml_manifest_parser.phase_spec:v1
+
+
+# SEM_BEGIN orchestrator_v1.yaml_manifest_parser.transition_spec:v1
+# type: CLASS
+# use_case: Typed transition rule between two top-level phases.
+# feature:
+#   - Phase routing is manifest-driven and depends on explicit status transitions
+# pre:
+#   -
+# post:
+#   -
+# invariant:
+#   - from_phase and on_status map to one flow.yaml transition row
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   -
+# depends:
+#   - PhaseId
+#   - PipelineStatus
+# sft: define typed transition specification record for V1 phase routing
+# idempotent: -
+# logs: -
 @dataclass(frozen=True, slots=True)
 class TransitionSpec:
     from_phase: PhaseId
@@ -29,6 +77,32 @@ class TransitionSpec:
     reason: str
 
 
+# SEM_END orchestrator_v1.yaml_manifest_parser.transition_spec:v1
+
+
+# SEM_BEGIN orchestrator_v1.yaml_manifest_parser.flow_manifest:v1
+# type: CLASS
+# use_case: Typed in-memory representation of flow.yaml.
+# feature:
+#   - Graph compilation uses one manifest object as the source of truth for phase order and transitions
+# pre:
+#   -
+# post:
+#   -
+# invariant:
+#   - phases and transitions remain aligned with one manifest version
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   -
+# depends:
+#   - PhaseSpec
+#   - TransitionSpec
+# sft: define typed top-level flow manifest record for the V1 orchestrator graph
+# idempotent: -
+# logs: -
 @dataclass(frozen=True, slots=True)
 class FlowManifest:
     version: str
@@ -39,12 +113,62 @@ class FlowManifest:
     transitions: list[TransitionSpec]
 
 
+# SEM_END orchestrator_v1.yaml_manifest_parser.flow_manifest:v1
+
+
+# SEM_BEGIN orchestrator_v1.yaml_manifest_parser.prompt_spec:v1
+# type: CLASS
+# use_case: Typed prompt reference for one pipeline step.
+# feature:
+#   - Runtime config binds one sub-role to one markdown prompt path
+# pre:
+#   -
+# post:
+#   -
+# invariant:
+#   - sub_role matches the prompt contract and shared prompt fragments
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   -
+# depends:
+#   - SubRole
+# sft: define typed prompt specification for one pipeline step
+# idempotent: -
+# logs: -
 @dataclass(frozen=True, slots=True)
 class PromptSpec:
     sub_role: SubRole
     path: str
 
 
+# SEM_END orchestrator_v1.yaml_manifest_parser.prompt_spec:v1
+
+
+# SEM_BEGIN orchestrator_v1.yaml_manifest_parser.pipeline_step_config:v1
+# type: CLASS
+# use_case: Typed configuration for one executor/reviewer/tester step.
+# feature:
+#   - TaskUnit runtime needs role prompt model retries and guardrails packaged per step
+# pre:
+#   -
+# post:
+#   -
+# invariant:
+#   - max_retries is an integer runtime bound for one step
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   -
+# depends:
+#   - PromptSpec
+# sft: define typed pipeline step configuration for one task unit role
+# idempotent: -
+# logs: -
 @dataclass(frozen=True, slots=True)
 class PipelineStepConfig:
     role_dir: str
@@ -54,6 +178,31 @@ class PipelineStepConfig:
     guardrails: list[str]
 
 
+# SEM_END orchestrator_v1.yaml_manifest_parser.pipeline_step_config:v1
+
+
+# SEM_BEGIN orchestrator_v1.yaml_manifest_parser.pipeline_config:v1
+# type: CLASS
+# use_case: Groups executor reviewer and optional tester configs for one TaskUnit pipeline.
+# feature:
+#   - V1 phases and worker execution both reuse the same universal pipeline structure
+# pre:
+#   -
+# post:
+#   -
+# invariant:
+#   - executor and reviewer are always present
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   -
+# depends:
+#   - PipelineStepConfig
+# sft: define typed universal task unit pipeline config with executor reviewer and optional tester
+# idempotent: -
+# logs: -
 @dataclass(frozen=True, slots=True)
 class PipelineConfig:
     executor: PipelineStepConfig
@@ -61,12 +210,63 @@ class PipelineConfig:
     tester: PipelineStepConfig | None
 
 
+# SEM_END orchestrator_v1.yaml_manifest_parser.pipeline_config:v1
+
+
+# SEM_BEGIN orchestrator_v1.yaml_manifest_parser.execute_strategy:v1
+# type: CLASS
+# use_case: Typed execution-strategy settings for the execute phase.
+# feature:
+#   - V1 keeps execute planner-driven and bounded by max_concurrent
+# pre:
+#   -
+# post:
+#   -
+# invariant:
+#   - max_concurrent is a positive integer runtime bound
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   -
+# depends:
+#   -
+# sft: define typed execute strategy config for planner-driven sequential runtime execution
+# idempotent: -
+# logs: -
 @dataclass(frozen=True, slots=True)
 class ExecuteStrategy:
     type: str
     max_concurrent: int
 
 
+# SEM_END orchestrator_v1.yaml_manifest_parser.execute_strategy:v1
+
+
+# SEM_BEGIN orchestrator_v1.yaml_manifest_parser.phase_runtime_config:v1
+# type: CLASS
+# use_case: Typed runtime configuration for one top-level phase.
+# feature:
+#   - Each phase binds a role pipeline and optional strategy while keeping one shared runtime schema
+# pre:
+#   -
+# post:
+#   -
+# invariant:
+#   - phase matches the key used in runtime_config.phases
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   -
+# depends:
+#   - PipelineConfig
+#   - ExecuteStrategy
+# sft: define typed per-phase runtime configuration for the V1 orchestrator
+# idempotent: -
+# logs: -
 @dataclass(frozen=True, slots=True)
 class PhaseRuntimeConfig:
     phase: str
@@ -77,6 +277,31 @@ class PhaseRuntimeConfig:
     strategy: ExecuteStrategy | None
 
 
+# SEM_END orchestrator_v1.yaml_manifest_parser.phase_runtime_config:v1
+
+
+# SEM_BEGIN orchestrator_v1.yaml_manifest_parser.runtime_config:v1
+# type: CLASS
+# use_case: Typed in-memory representation of phases_and_roles.yaml.
+# feature:
+#   - Runtime compilation and prompt loading consume one typed config tree instead of raw YAML
+# pre:
+#   -
+# post:
+#   -
+# invariant:
+#   - phase names are the lookup keys used throughout the runtime
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   -
+# depends:
+#   - PhaseRuntimeConfig
+# sft: define typed runtime config record for docs paths openhands settings and per-phase pipelines
+# idempotent: -
+# logs: -
 @dataclass(frozen=True, slots=True)
 class RuntimeConfig:
     docs_root_alias: str
@@ -88,6 +313,32 @@ class RuntimeConfig:
     phases: dict[str, PhaseRuntimeConfig]
 
 
+# SEM_END orchestrator_v1.yaml_manifest_parser.runtime_config:v1
+
+
+# SEM_BEGIN orchestrator_v1.yaml_manifest_parser._parse_prompt:v1
+# type: METHOD
+# use_case: Converts a raw prompt config dict into a typed PromptSpec.
+# feature:
+#   - Manifest parsing should normalize prompt dictionaries before higher-level runtime config assembly
+# pre:
+#   - raw contains sub_role and path keys
+# post:
+#   - returns a PromptSpec
+# invariant:
+#   - raw is not mutated
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   - KeyError: required keys are missing
+# depends:
+#   - PromptSpec
+#   - SubRole
+# sft: parse raw prompt configuration dict into typed prompt spec
+# idempotent: true
+# logs: -
 def _parse_prompt(raw: dict) -> PromptSpec:
     return PromptSpec(
         sub_role=SubRole(raw["sub_role"]),
@@ -95,6 +346,32 @@ def _parse_prompt(raw: dict) -> PromptSpec:
     )
 
 
+# SEM_END orchestrator_v1.yaml_manifest_parser._parse_prompt:v1
+
+
+# SEM_BEGIN orchestrator_v1.yaml_manifest_parser._parse_step:v1
+# type: METHOD
+# use_case: Converts a raw pipeline-step dict into a typed PipelineStepConfig.
+# feature:
+#   - Executor reviewer and tester steps must share one typed parser path
+# pre:
+#   - raw contains role_dir prompt model and max_retries keys
+# post:
+#   - returns a PipelineStepConfig
+# invariant:
+#   - raw is not mutated
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   - KeyError: required keys are missing
+# depends:
+#   - PipelineStepConfig
+#   - _parse_prompt
+# sft: parse raw step configuration dict into typed pipeline step config
+# idempotent: true
+# logs: -
 def _parse_step(raw: dict) -> PipelineStepConfig:
     return PipelineStepConfig(
         role_dir=raw["role_dir"],
@@ -105,6 +382,32 @@ def _parse_step(raw: dict) -> PipelineStepConfig:
     )
 
 
+# SEM_END orchestrator_v1.yaml_manifest_parser._parse_step:v1
+
+
+# SEM_BEGIN orchestrator_v1.yaml_manifest_parser._parse_pipeline:v1
+# type: METHOD
+# use_case: Converts a raw executor/reviewer/tester pipeline mapping into a typed PipelineConfig.
+# feature:
+#   - Phase-level and worker-level pipelines reuse the same parsing logic
+# pre:
+#   -
+# post:
+#   - returns PipelineConfig or None when the raw pipeline is absent
+# invariant:
+#   - raw is not mutated
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   - KeyError: executor or reviewer config is missing in a non-null pipeline
+# depends:
+#   - PipelineConfig
+#   - _parse_step
+# sft: parse raw pipeline mapping into typed executor reviewer and optional tester config
+# idempotent: true
+# logs: -
 def _parse_pipeline(raw: dict | None) -> PipelineConfig | None:
     if raw is None:
         return None
@@ -114,6 +417,9 @@ def _parse_pipeline(raw: dict | None) -> PipelineConfig | None:
         reviewer=_parse_step(raw["reviewer"]),
         tester=_parse_step(tester_raw) if tester_raw else None,
     )
+
+
+# SEM_END orchestrator_v1.yaml_manifest_parser._parse_pipeline:v1
 
 
 # SEM_BEGIN orchestrator_v1.yaml_manifest_parser.load_flow_manifest:v1

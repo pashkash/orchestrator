@@ -2,16 +2,37 @@
 
 from __future__ import annotations
 
-import logging
-
 from workflow_runtime.graph_compiler.state_schema import PipelineState
 from workflow_runtime.graph_compiler.yaml_manifest_parser import FlowManifest
 from workflow_runtime.integrations.observability import ensure_trace_id
+from workflow_runtime.integrations.runtime_logging import get_logger
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
+# SEM_BEGIN orchestrator_v1.edge_evaluators.collect_phase_targets:v1
+# type: METHOD
+# use_case: Collects all unique outgoing targets for one phase from the flow manifest.
+# feature:
+#   - LangGraph conditional edges need the complete set of manifest-declared targets for one phase
+# pre:
+#   - manifest.transitions is loaded
+# post:
+#   - returns sorted unique target phase ids for the requested phase
+# invariant:
+#   - manifest is not mutated
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   -
+# depends:
+#   - FlowManifest
+# sft: collect sorted unique outgoing transition targets for one phase from flow manifest
+# idempotent: true
+# logs: -
 def collect_phase_targets(manifest: FlowManifest, phase_id: str) -> list[str]:
     targets = {
         transition.to_phase
@@ -19,6 +40,9 @@ def collect_phase_targets(manifest: FlowManifest, phase_id: str) -> list[str]:
         if transition.from_phase == phase_id
     }
     return sorted(targets)
+
+
+# SEM_END orchestrator_v1.edge_evaluators.collect_phase_targets:v1
 
 
 # SEM_BEGIN orchestrator_v1.edge_evaluators.resolve_next_phase:v1
@@ -62,6 +86,14 @@ def resolve_next_phase(phase_id: str, state: PipelineState, manifest: FlowManife
             logger.info(
                 "[EdgeEvaluators][resolve_next_phase][DecisionPoint] trace_id=%s | "
                 "Branch: transition_match. Reason: phase=%s, status=%s, target=%s",
+                trace_id,
+                phase_id,
+                current_status,
+                transition.to_phase,
+            )
+            logger.info(
+                "[EdgeEvaluators][resolve_next_phase][StepComplete] trace_id=%s | "
+                "Resolved next phase. phase=%s, status=%s, target=%s",
                 trace_id,
                 phase_id,
                 current_status,

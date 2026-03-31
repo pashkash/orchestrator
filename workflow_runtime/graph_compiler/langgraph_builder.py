@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 import os
 from typing import Any
 
@@ -16,6 +15,7 @@ from workflow_runtime.graph_compiler.yaml_manifest_parser import FlowManifest, R
 from workflow_runtime.integrations.observability import ensure_trace_id
 from workflow_runtime.integrations.openhands_http_api import OpenHandsHttpApi
 from workflow_runtime.integrations.phase_config_loader import get_flow_manifest, get_runtime_config
+from workflow_runtime.integrations.runtime_logging import get_logger
 from workflow_runtime.node_implementations.human_gate import run_human_gate
 from workflow_runtime.node_implementations.phases.collect_phase import run_collect_phase
 from workflow_runtime.node_implementations.phases.execute_phase import run_execute_phase
@@ -24,7 +24,7 @@ from workflow_runtime.node_implementations.phases.validate_phase import run_vali
 from workflow_runtime.node_implementations.task_unit import TaskUnitRunner
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 # SEM_BEGIN orchestrator_v1.langgraph_builder.build_driver:v1
@@ -53,18 +53,62 @@ logger = logging.getLogger(__name__)
 # idempotent: true
 # logs: query: LangGraphBuilder build_driver
 def _build_driver(driver_mode: DriverMode, runtime_config: RuntimeConfig) -> BaseDriver:
+    trace_id = ensure_trace_id()
+    logger.info(
+        "[LangGraphBuilder][_build_driver][ContextAnchor] trace_id=%s | "
+        "Building runtime driver. driver_mode=%s",
+        trace_id,
+        driver_mode,
+    )
     if driver_mode == DriverMode.MOCK:
-        return MockDriver()
+        logger.info(
+            "[LangGraphBuilder][_build_driver][DecisionPoint] trace_id=%s | "
+            "Branch: mock_driver. Reason: driver_mode=mock",
+            trace_id,
+        )
+        driver = MockDriver()
+        logger.info(
+            "[LangGraphBuilder][_build_driver][StepComplete] trace_id=%s | "
+            "Built runtime driver. driver_class=%s",
+            trace_id,
+            driver.__class__.__name__,
+        )
+        return driver
     if driver_mode != DriverMode.OPENHANDS:
+        logger.error(
+            "[LangGraphBuilder][_build_driver][ErrorHandled][ERR:PRECONDITION] trace_id=%s | "
+            "Unsupported driver mode. driver_mode=%s",
+            trace_id,
+            driver_mode,
+        )
         raise ValueError(f"Unsupported driver mode: {driver_mode}")
 
     base_url_env = runtime_config.openhands["base_url_env"]
     llm_api_key_env = runtime_config.openhands["llm_api_key_env"]
     base_url = os.getenv(base_url_env)
     llm_api_key = os.getenv(llm_api_key_env)
+    logger.info(
+        "[LangGraphBuilder][_build_driver][PreCheck] trace_id=%s | "
+        "Checking OpenHands env vars. base_url_env=%s, llm_api_key_env=%s",
+        trace_id,
+        base_url_env,
+        llm_api_key_env,
+    )
     if not base_url:
+        logger.error(
+            "[LangGraphBuilder][_build_driver][ErrorHandled][ERR:PRECONDITION] trace_id=%s | "
+            "Missing OpenHands base URL env var. env=%s",
+            trace_id,
+            base_url_env,
+        )
         raise ValueError(f"Missing required env var: {base_url_env}")
     if not llm_api_key:
+        logger.error(
+            "[LangGraphBuilder][_build_driver][ErrorHandled][ERR:PRECONDITION] trace_id=%s | "
+            "Missing OpenHands API key env var. env=%s",
+            trace_id,
+            llm_api_key_env,
+        )
         raise ValueError(f"Missing required env var: {llm_api_key_env}")
 
     api = OpenHandsHttpApi(
@@ -72,24 +116,56 @@ def _build_driver(driver_mode: DriverMode, runtime_config: RuntimeConfig) -> Bas
         timeout_seconds=int(runtime_config.openhands["timeout_seconds"]),
         poll_interval_seconds=int(runtime_config.openhands["poll_interval_seconds"]),
     )
-    return OpenHandsDriver(
+    driver = OpenHandsDriver(
         api=api,
         llm_api_key=llm_api_key,
         llm_base_url=str(runtime_config.openhands["llm_base_url"]),
         cli_mode=bool(runtime_config.openhands["cli_mode"]),
         tools=list(runtime_config.openhands.get("tools", [])),
     )
+    logger.info(
+        "[LangGraphBuilder][_build_driver][StepComplete] trace_id=%s | "
+        "Built runtime driver. driver_class=%s",
+        trace_id,
+        driver.__class__.__name__,
+    )
+    return driver
 
 
 # SEM_END orchestrator_v1.langgraph_builder.build_driver:v1
 
 
+# SEM_BEGIN orchestrator_v1.langgraph_builder.phase_router:v1
+# type: METHOD
+# use_case: Builds one conditional-edge router closure for a specific phase id.
+# feature:
+#   - LangGraph conditional edges need a callable that translates manifest status routing into node targets
+# pre:
+#   - phase_id exists in the loaded manifest
+# post:
+#   - returns a router callable that maps state to the next phase or END
+# invariant:
+#   - closure reuses the same manifest without mutating it
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   - KeyError: no transition exists for the current phase/status pair
+# depends:
+#   - resolve_next_phase
+# sft: build a conditional-edge router closure for one phase using the loaded flow manifest
+# idempotent: true
+# logs: query: LangGraphBuilder _phase_router
 def _phase_router(phase_id: str, manifest: FlowManifest):
     def route(state: PipelineState) -> str:
         target = resolve_next_phase(phase_id, state, manifest)
         return END if target == manifest.end_phase else target
 
     return route
+
+
+# SEM_END orchestrator_v1.langgraph_builder.phase_router:v1
 
 
 # SEM_BEGIN orchestrator_v1.langgraph_builder.compile_graph:v1

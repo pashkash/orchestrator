@@ -2,23 +2,72 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass, field
 from typing import Any
 
 from workflow_runtime.graph_compiler.state_schema import PipelineStatus, SubRole
 from workflow_runtime.integrations.observability import ensure_trace_id
+from workflow_runtime.integrations.runtime_logging import get_logger
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
+# SEM_BEGIN orchestrator_v1.guardrail_checker.guardrail_result:v1
+# type: CLASS
+# use_case: Normalized outcome of one guardrail pass over a TaskUnit step payload.
+# feature:
+#   - TaskUnit must convert field/checklist validation into a status plus warning bundle
+#   - Task card 2026-03-24_1800__multi-agent-system-design, D4
+# pre:
+#   -
+# post:
+#   -
+# invariant:
+#   - status is always a PipelineStatus value
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   -
+# depends:
+#   - PipelineStatus
+# sft: define normalized guardrail result carrying status and warnings
+# idempotent: -
+# logs: -
 @dataclass(frozen=True, slots=True)
 class GuardrailResult:
     status: PipelineStatus
     warnings: list[str] = field(default_factory=list)
 
 
+# SEM_END orchestrator_v1.guardrail_checker.guardrail_result:v1
+
+
+# SEM_BEGIN orchestrator_v1.guardrail_checker._failure_status:v1
+# type: METHOD
+# use_case: Maps a failing step to the matching NEEDS_FIX_* pipeline status.
+# feature:
+#   - Guardrail failures must point repair loops to the correct executor reviewer or tester branch
+# pre:
+#   - step_name is one of executor/reviewer/tester
+# post:
+#   - returns the matching repair status
+# invariant:
+#   - no runtime state is mutated
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   -
+# depends:
+#   - PipelineStatus
+#   - SubRole
+# sft: map failing task unit sub-role to the corresponding needs-fix pipeline status
+# idempotent: true
+# logs: -
 def _failure_status(step_name: SubRole) -> PipelineStatus:
     if step_name == SubRole.REVIEWER:
         return PipelineStatus.NEEDS_FIX_REVIEW
@@ -27,6 +76,31 @@ def _failure_status(step_name: SubRole) -> PipelineStatus:
     return PipelineStatus.NEEDS_FIX_EXECUTOR
 
 
+# SEM_END orchestrator_v1.guardrail_checker._failure_status:v1
+
+
+# SEM_BEGIN orchestrator_v1.guardrail_checker._required_keys:v1
+# type: METHOD
+# use_case: Returns the minimal payload keys required for one phase/sub-role contract.
+# feature:
+#   - Guardrails need phase-aware contract checks because collect plan validate and worker execution return different payload shapes
+# pre:
+#   - step_name is one of executor/reviewer/tester
+# post:
+#   - returns the required key list for that phase/sub-role
+# invariant:
+#   - no runtime state is mutated
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   -
+# depends:
+#   - SubRole
+# sft: derive required payload keys for one phase and task unit sub-role
+# idempotent: true
+# logs: -
 def _required_keys(phase_id: str, step_name: SubRole) -> list[str]:
     if step_name == SubRole.REVIEWER:
         return ["status", "feedback"]
@@ -39,6 +113,9 @@ def _required_keys(phase_id: str, step_name: SubRole) -> list[str]:
     if phase_id == "validate":
         return ["status", "cross_cutting_result"]
     return ["status", "structured_output"]
+
+
+# SEM_END orchestrator_v1.guardrail_checker._required_keys:v1
 
 
 # SEM_BEGIN orchestrator_v1.guardrail_checker.run_guardrails:v1

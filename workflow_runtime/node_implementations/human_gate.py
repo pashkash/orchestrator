@@ -2,21 +2,43 @@
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 from langgraph.types import interrupt
 
 from workflow_runtime.graph_compiler.state_schema import PhaseId, PipelineState, PipelineStatus
 from workflow_runtime.integrations.observability import ensure_trace_id
+from workflow_runtime.integrations.runtime_logging import get_logger
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 DEFAULT_HUMAN_GATE_QUESTION = "Human decision is required to continue the pipeline"
 
 
+# SEM_BEGIN orchestrator_v1.human_gate._is_approved:v1
+# type: METHOD
+# use_case: Normalizes human-gate responses into a boolean approval signal.
+# feature:
+#   - Human resume payloads may come back as booleans action dicts or free-form text from the interrupt layer
+# pre:
+#   -
+# post:
+#   - returns true only for approval/continue style responses
+# invariant:
+#   - response is not mutated
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   -
+# depends:
+#   -
+# sft: normalize human gate response payloads into an approval boolean
+# idempotent: true
+# logs: -
 def _is_approved(response: Any) -> bool:
     if isinstance(response, dict):
         if "approved" in response:
@@ -24,6 +46,9 @@ def _is_approved(response: Any) -> bool:
         if "action" in response:
             return str(response["action"]).lower() in {"approve", "continue", "resume"}
     return str(response).strip().lower() in {"approve", "approved", "continue", "resume", "yes", "ok"}
+
+
+# SEM_END orchestrator_v1.human_gate._is_approved:v1
 
 
 # SEM_BEGIN orchestrator_v1.human_gate.run_human_gate:v1

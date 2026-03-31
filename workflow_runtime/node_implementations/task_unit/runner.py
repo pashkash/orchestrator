@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 from workflow_runtime.agent_drivers.base_driver import BaseDriver, DriverResult
@@ -16,17 +15,43 @@ from workflow_runtime.graph_compiler.state_schema import (
 )
 from workflow_runtime.graph_compiler.yaml_manifest_parser import PipelineConfig
 from workflow_runtime.integrations.observability import ensure_trace_id
+from workflow_runtime.integrations.runtime_logging import get_logger
 from workflow_runtime.node_implementations.task_unit.executor_node import run_executor_step
 from workflow_runtime.node_implementations.task_unit.guardrail_checker import run_guardrails
 from workflow_runtime.node_implementations.task_unit.reviewer_node import run_reviewer_step
 from workflow_runtime.node_implementations.task_unit.tester_node import run_tester_step
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
+# SEM_BEGIN orchestrator_v1.task_unit_runner._normalize_status:v1
+# type: METHOD
+# use_case: Normalizes raw driver status values into PipelineStatus.
+# feature:
+#   - Driver backends may return enum instances strings or missing statuses and TaskUnit needs one stable representation
+# pre:
+#   -
+# post:
+#   - returns a PipelineStatus value, defaulting to PASS when status is missing
+# invariant:
+#   - input value is not mutated
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   - ValueError: status string is not a valid PipelineStatus value
+# depends:
+#   - PipelineStatus
+# sft: normalize raw driver status values into a PipelineStatus enum with PASS as fallback
+# idempotent: true
+# logs: -
 def _normalize_status(status: str | PipelineStatus | None) -> PipelineStatus:
     return PipelineStatus(str(status or PipelineStatus.PASS).upper())
+
+
+# SEM_END orchestrator_v1.task_unit_runner._normalize_status:v1
 
 
 # SEM_BEGIN orchestrator_v1.task_unit_runner._structured_output_from_payload:v1
@@ -79,9 +104,56 @@ def _structured_output_from_payload(payload: dict[str, Any]) -> StructuredOutput
 # SEM_END orchestrator_v1.task_unit_runner._structured_output_from_payload:v1
 
 
+# SEM_BEGIN orchestrator_v1.task_unit_runner.task_unit_runner:v1
+# type: CLASS
+# use_case: Executes the universal TaskUnit pipeline for phase-level and subtask-level work.
+# feature:
+#   - V1 standardizes execution around executor reviewer optional tester and simple guardrails
+#   - Task card 2026-03-24_1800__multi-agent-system-design, D4-D5
+# pre:
+#   -
+# post:
+#   -
+# invariant:
+#   - one runner instance delegates all step execution to a single driver boundary
+# modifies (internal):
+#   -
+# emits (external):
+#   - external.driver_runtime
+# errors:
+#   - RuntimeError: driver execution failed
+# depends:
+#   - BaseDriver
+# sft: implement universal task unit runner over executor reviewer tester and guardrails
+# idempotent: false
+# logs: query: TaskUnitRunner trace_id
 class TaskUnitRunner:
+    # SEM_BEGIN orchestrator_v1.task_unit_runner.task_unit_runner.__init__:v1
+    # type: METHOD
+    # use_case: Binds one runtime driver instance to a TaskUnitRunner.
+    # feature:
+    #   - All executor reviewer and tester steps for one runner share the same runtime backend
+    # pre:
+    #   - driver implements BaseDriver
+    # post:
+    #   - runner stores the provided driver for subsequent step execution
+    # invariant:
+    #   - driver reference is reused across all task unit calls made by this runner
+    # modifies (internal):
+    #   -
+    # emits (external):
+    #   -
+    # errors:
+    #   -
+    # depends:
+    #   - BaseDriver
+    # sft: initialize task unit runner with one runtime driver instance
+    # idempotent: false
+    # logs: -
     def __init__(self, driver: BaseDriver) -> None:
         self._driver = driver
+
+    # SEM_END orchestrator_v1.task_unit_runner.task_unit_runner.__init__:v1
 
     # SEM_BEGIN orchestrator_v1.task_unit_runner._run_executor_with_retries:v1
     # type: METHOD
@@ -218,6 +290,13 @@ class TaskUnitRunner:
         )
 
         # === PRE[0]: workspace_root not empty ===
+        logger.info(
+            "[TaskUnitRunner][run][PreCheck] trace_id=%s | "
+            "Checking workspace root is not empty. phase=%s, role_dir=%s",
+            resolved_trace_id,
+            phase_id,
+            role_dir,
+        )
         if not workspace_root:
             logger.warning(
                 "[TaskUnitRunner][run][ErrorHandled][ERR:PRECONDITION] trace_id=%s | "
@@ -242,6 +321,14 @@ class TaskUnitRunner:
         )
         executor_status = _normalize_status(executor_result.status)
         if executor_status != PipelineStatus.PASS:
+            logger.info(
+                "[TaskUnitRunner][run][StepComplete] trace_id=%s | "
+                "Task unit finished with executor status. phase=%s, role_dir=%s, status=%s",
+                resolved_trace_id,
+                phase_id,
+                role_dir,
+                executor_status,
+            )
             return TaskUnitResult(
                 status=executor_status,
                 payload=executor_result.payload,
@@ -274,6 +361,14 @@ class TaskUnitRunner:
             else reviewer_guardrails.status
         )
         if reviewer_status != PipelineStatus.PASS:
+            logger.info(
+                "[TaskUnitRunner][run][StepComplete] trace_id=%s | "
+                "Task unit finished with reviewer status. phase=%s, role_dir=%s, status=%s",
+                resolved_trace_id,
+                phase_id,
+                role_dir,
+                reviewer_status,
+            )
             return TaskUnitResult(
                 status=reviewer_status,
                 payload=executor_result.payload,
@@ -312,6 +407,14 @@ class TaskUnitRunner:
             )
             latest_conversation_id = tester_result.conversation_id or latest_conversation_id
             if tester_status != PipelineStatus.PASS:
+                logger.info(
+                    "[TaskUnitRunner][run][StepComplete] trace_id=%s | "
+                    "Task unit finished with tester status. phase=%s, role_dir=%s, status=%s",
+                    resolved_trace_id,
+                    phase_id,
+                    role_dir,
+                    tester_status,
+                )
                 return TaskUnitResult(
                     status=tester_status,
                     payload=executor_result.payload,
@@ -344,3 +447,6 @@ class TaskUnitRunner:
         )
 
     # SEM_END orchestrator_v1.task_unit_runner.run:v1
+
+
+# SEM_END orchestrator_v1.task_unit_runner.task_unit_runner:v1

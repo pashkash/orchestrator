@@ -14,6 +14,29 @@ from enum import StrEnum
 from typing import Any, TypedDict
 
 
+# SEM_BEGIN orchestrator_v1.state.phase_id:v1
+# type: CLASS
+# use_case: Enumerates the fixed top-level phases of the V1 orchestrator graph.
+# feature:
+#   - The runtime graph intentionally stays small and phase-driven in V1
+#   - Task card 2026-03-24_1800__multi-agent-system-design, D0-D3
+# pre:
+#   -
+# post:
+#   -
+# invariant:
+#   - enum values match flow.yaml phase ids
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   -
+# depends:
+#   -
+# sft: define enum of top-level V1 orchestration phases aligned with flow manifest ids
+# idempotent: -
+# logs: -
 class PhaseId(StrEnum):
     COLLECT = "collect"
     PLAN = "plan"
@@ -22,6 +45,32 @@ class PhaseId(StrEnum):
     HUMAN_GATE = "human_gate"
 
 
+# SEM_END orchestrator_v1.state.phase_id:v1
+
+
+# SEM_BEGIN orchestrator_v1.state.pipeline_status:v1
+# type: CLASS
+# use_case: Enumerates normalized phase and task-unit statuses used across the runtime.
+# feature:
+#   - Phase routing and task-unit repair loops depend on one shared status vocabulary
+#   - Task card 2026-03-24_1800__multi-agent-system-design, D3-D5
+# pre:
+#   -
+# post:
+#   -
+# invariant:
+#   - enum values match flow.yaml transition statuses and runtime contracts
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   -
+# depends:
+#   -
+# sft: define normalized pipeline status enum shared by task unit outputs and phase routing
+# idempotent: -
+# logs: -
 class PipelineStatus(StrEnum):
     PASS = "PASS"
     NEEDS_INFO = "NEEDS_INFO"
@@ -35,6 +84,32 @@ class PipelineStatus(StrEnum):
     BLOCKED = "BLOCKED"
 
 
+# SEM_END orchestrator_v1.state.pipeline_status:v1
+
+
+# SEM_BEGIN orchestrator_v1.state.subtask_status:v1
+# type: CLASS
+# use_case: Enumerates lifecycle states for mutable-plan subtasks.
+# feature:
+#   - Execute phase mutates the plan incrementally and tracks retries escalations and cancellation per subtask
+#   - Task card 2026-03-24_1800__multi-agent-system-design, D5-D6
+# pre:
+#   -
+# post:
+#   -
+# invariant:
+#   - enum values remain lowercase because they are embedded into plan payloads and task artifacts
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   -
+# depends:
+#   -
+# sft: define mutable plan subtask lifecycle statuses for sequential V1 execution
+# idempotent: -
+# logs: -
 class SubtaskStatus(StrEnum):
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
@@ -45,6 +120,32 @@ class SubtaskStatus(StrEnum):
     ESCALATED = "escalated"
 
 
+# SEM_END orchestrator_v1.state.subtask_status:v1
+
+
+# SEM_BEGIN orchestrator_v1.state.structured_output_status:v1
+# type: CLASS
+# use_case: Enumerates completion statuses stored inside StructuredOutput records.
+# feature:
+#   - StructuredOutput needs a portable status field independent of richer pipeline routing statuses
+#   - Task card 2026-03-24_1800__multi-agent-system-design, D4-D6
+# pre:
+#   -
+# post:
+#   -
+# invariant:
+#   - values remain lowercase for artifact serialization compatibility
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   -
+# depends:
+#   -
+# sft: define portable structured output status enum for executor result artifacts
+# idempotent: -
+# logs: -
 class StructuredOutputStatus(StrEnum):
     DONE = "done"
     FAILED = "failed"
@@ -52,15 +153,70 @@ class StructuredOutputStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+# SEM_END orchestrator_v1.state.structured_output_status:v1
+
+
+# SEM_BEGIN orchestrator_v1.state.driver_mode:v1
+# type: CLASS
+# use_case: Enumerates supported runtime-driver backends for graph compilation.
+# feature:
+#   - The same graph can switch between mock and OpenHands backends without changing phase wrappers
+#   - Task card 2026-03-24_1800__multi-agent-system-design, D5
+# pre:
+#   -
+# post:
+#   -
+# invariant:
+#   - values match runtime configuration and env var parsing
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   -
+# depends:
+#   -
+# sft: define runtime driver mode enum for mock and OpenHands execution backends
+# idempotent: -
+# logs: -
 class DriverMode(StrEnum):
     MOCK = "mock"
     OPENHANDS = "openhands"
 
 
+# SEM_END orchestrator_v1.state.driver_mode:v1
+
+
+# SEM_BEGIN orchestrator_v1.state.sub_role:v1
+# type: CLASS
+# use_case: Enumerates the internal roles of one universal TaskUnit pipeline step.
+# feature:
+#   - Prompt composition and guardrails differentiate executor reviewer and tester within the same phase
+#   - Task card 2026-03-24_1800__multi-agent-system-design, D4
+# pre:
+#   -
+# post:
+#   -
+# invariant:
+#   - values stay aligned with runtime manifests and shared prompt filenames
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   -
+# depends:
+#   -
+# sft: define task unit sub-role enum for executor reviewer and tester prompt flows
+# idempotent: -
+# logs: -
 class SubRole(StrEnum):
     EXECUTOR = "executor"
     REVIEWER = "reviewer"
     TESTER = "tester"
+
+
+# SEM_END orchestrator_v1.state.sub_role:v1
 
 
 # SEM_BEGIN orchestrator_v1.state.file_change:v1

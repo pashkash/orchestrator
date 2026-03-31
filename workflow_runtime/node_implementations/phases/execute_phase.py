@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import logging
-
 from workflow_runtime.graph_compiler.state_schema import (
     PhaseId,
     PipelineState,
@@ -14,13 +12,36 @@ from workflow_runtime.graph_compiler.state_schema import (
 )
 from workflow_runtime.graph_compiler.yaml_manifest_parser import PhaseRuntimeConfig
 from workflow_runtime.integrations.observability import ensure_trace_id
+from workflow_runtime.integrations.runtime_logging import get_logger
 from workflow_runtime.node_implementations.status_aggregation import get_ready_subtasks, has_incomplete_subtasks
 from workflow_runtime.node_implementations.task_unit import TaskUnitRunner
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
+# SEM_BEGIN orchestrator_v1.execute_phase._clone_plan:v1
+# type: METHOD
+# use_case: Produces a mutable copy of the current plan before execute-phase mutations.
+# feature:
+#   - Phase wrappers should return partial state updates without mutating the prior LangGraph state object in-place
+# pre:
+#   -
+# post:
+#   - returns a cloned list of SubtaskState items
+# invariant:
+#   - cloned subtasks preserve the original execution order
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   -
+# depends:
+#   - SubtaskState
+# sft: clone the current mutable plan into a fresh list before execute phase mutations
+# idempotent: true
+# logs: -
 def _clone_plan(plan: list[SubtaskState]) -> list[SubtaskState]:
     return [
         SubtaskState(
@@ -40,6 +61,31 @@ def _clone_plan(plan: list[SubtaskState]) -> list[SubtaskState]:
     ]
 
 
+# SEM_END orchestrator_v1.execute_phase._clone_plan:v1
+
+
+# SEM_BEGIN orchestrator_v1.execute_phase._append_structured_output:v1
+# type: METHOD
+# use_case: Appends a new StructuredOutput only when that subtask id is not already present.
+# feature:
+#   - Execute phase may loop across replans and must avoid duplicating completed outputs
+# pre:
+#   - structured_output.subtask_id is not empty
+# post:
+#   - returns the original list or a new list extended with the unique output
+# invariant:
+#   - existing output order is preserved
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   -
+# depends:
+#   - StructuredOutput
+# sft: append structured output to the collected outputs list only if its subtask id is new
+# idempotent: true
+# logs: -
 def _append_structured_output(
     outputs: list[StructuredOutput],
     structured_output: StructuredOutput,
@@ -48,6 +94,9 @@ def _append_structured_output(
     if structured_output.subtask_id in existing_ids:
         return outputs
     return outputs + [structured_output]
+
+
+# SEM_END orchestrator_v1.execute_phase._append_structured_output:v1
 
 
 # SEM_BEGIN orchestrator_v1.execute_phase.run_execute_phase:v1
@@ -105,6 +154,13 @@ def run_execute_phase(
                     "[ExecutePhase][run_execute_phase][DecisionPoint] trace_id=%s | "
                     "Branch: needs_replan. Reason: no_ready_subtasks=True, incomplete_plan=True",
                     trace_id,
+                )
+                logger.info(
+                    "[ExecutePhase][run_execute_phase][StepComplete] trace_id=%s | "
+                    "Execute phase finished. status=%s, outputs=%d",
+                    trace_id,
+                    PipelineStatus.NEEDS_REPLAN,
+                    len(outputs),
                 )
                 return {
                     "current_phase": PhaseId.EXECUTE,
@@ -184,6 +240,14 @@ def run_execute_phase(
                 subtask.id,
                 result.status,
             )
+            logger.info(
+                "[ExecutePhase][run_execute_phase][StepComplete] trace_id=%s | "
+                "Execute phase finished. status=%s, outputs=%d, active_subtask_id=%s",
+                trace_id,
+                PipelineStatus.ESCALATE_TO_HUMAN,
+                len(outputs),
+                subtask.id,
+            )
             return {
                 "current_phase": PhaseId.EXECUTE,
                 "current_status": PipelineStatus.ESCALATE_TO_HUMAN,
@@ -219,6 +283,14 @@ def run_execute_phase(
             result.status,
             subtask.retry_count,
             subtask.max_retries,
+        )
+        logger.info(
+            "[ExecutePhase][run_execute_phase][StepComplete] trace_id=%s | "
+            "Execute phase finished. status=%s, outputs=%d, active_subtask_id=%s",
+            trace_id,
+            PipelineStatus.NEEDS_REPLAN,
+            len(outputs),
+            subtask.id,
         )
         return {
             "current_phase": PhaseId.EXECUTE,

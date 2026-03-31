@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 import re
 from typing import Any
 
@@ -15,13 +14,36 @@ from workflow_runtime.integrations.openhands_http_api import OpenHandsHttpApi
 from workflow_runtime.integrations.openhands_runtime import (
     OPENHANDS_EVENT_SEARCH_LIMIT_MAX,
 )
+from workflow_runtime.integrations.runtime_logging import get_logger
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _YAML_BLOCK_RE = re.compile(r"```(?:yaml|yml)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 
 
+# SEM_BEGIN orchestrator_v1.openhands_driver._extract_texts:v1
+# type: METHOD
+# use_case: Recursively extracts all text leaves from nested OpenHands state/event payloads.
+# feature:
+#   - Driver parsing must normalize heterogenous OpenHands response shapes before YAML extraction
+# pre:
+#   -
+# post:
+#   - returns a flat list of text fragments discovered in the nested payload
+# invariant:
+#   - input node is not mutated
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   -
+# depends:
+#   -
+# sft: recursively collect text fragments from nested OpenHands state and event payloads
+# idempotent: true
+# logs: -
 def _extract_texts(node: Any) -> list[str]:
     texts: list[str] = []
     if isinstance(node, dict):
@@ -34,6 +56,9 @@ def _extract_texts(node: Any) -> list[str]:
         for item in node:
             texts.extend(_extract_texts(item))
     return texts
+
+
+# SEM_END orchestrator_v1.openhands_driver._extract_texts:v1
 
 
 # SEM_BEGIN orchestrator_v1.openhands_driver._coerce_payload:v1
@@ -74,6 +99,29 @@ def _coerce_payload(raw_text: str) -> dict[str, Any]:
 # SEM_END orchestrator_v1.openhands_driver._coerce_payload:v1
 
 
+# SEM_BEGIN orchestrator_v1.openhands_driver._status_for_parse_failure:v1
+# type: METHOD
+# use_case: Maps parse failures to the phase-specific fix status expected by TaskUnit.
+# feature:
+#   - Reviewer and tester parse failures must not collapse into executor repair statuses
+# pre:
+#   - sub_role is one of executor/reviewer/tester
+# post:
+#   - returns the correct NEEDS_FIX_* PipelineStatus for that sub-role
+# invariant:
+#   - no runtime state is mutated
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   -
+# depends:
+#   - PipelineStatus
+#   - SubRole
+# sft: map one task unit sub-role to the corresponding parse-failure pipeline status
+# idempotent: true
+# logs: -
 def _status_for_parse_failure(sub_role: SubRole) -> PipelineStatus:
     if sub_role == SubRole.REVIEWER:
         return PipelineStatus.NEEDS_FIX_REVIEW
@@ -82,7 +130,55 @@ def _status_for_parse_failure(sub_role: SubRole) -> PipelineStatus:
     return PipelineStatus.NEEDS_FIX_EXECUTOR
 
 
+# SEM_END orchestrator_v1.openhands_driver._status_for_parse_failure:v1
+
+
+# SEM_BEGIN orchestrator_v1.openhands_driver.openhands_driver:v1
+# type: CLASS
+# use_case: Real runtime driver that executes TaskUnit steps through OpenHands.
+# feature:
+#   - Phase 3 keeps the same TaskUnit contract while replacing the backend with OpenHands REST execution
+#   - Task card 2026-03-24_1800__multi-agent-system-design, D4-D5
+# pre:
+#   -
+# post:
+#   -
+# invariant:
+#   - the driver returns normalized DriverResult objects regardless of raw OpenHands response shape
+# modifies (internal):
+#   -
+# emits (external):
+#   - external.openhands_server
+# errors:
+#   - RuntimeError: OpenHands execution failed
+# depends:
+#   - OpenHandsHttpApi
+# sft: implement real OpenHands-backed runtime driver for one universal task unit step
+# idempotent: false
+# logs: query: OpenHandsDriver trace_id
 class OpenHandsDriver(BaseDriver):
+    # SEM_BEGIN orchestrator_v1.openhands_driver.openhands_driver.__init__:v1
+    # type: METHOD
+    # use_case: Stores the OpenHands API client and runtime LLM/tool settings for future task execution.
+    # feature:
+    #   - Runtime graph compilation injects one configured OpenHands backend into the universal TaskUnit
+    # pre:
+    #   - api is a ready OpenHandsHttpApi client
+    # post:
+    #   - driver keeps the provided API client credentials base URL mode and tools
+    # invariant:
+    #   - provided configuration is reused for all subsequent run_task calls
+    # modifies (internal):
+    #   -
+    # emits (external):
+    #   -
+    # errors:
+    #   -
+    # depends:
+    #   - OpenHandsHttpApi
+    # sft: initialize OpenHands runtime driver with API client llm settings cli mode and tool list
+    # idempotent: false
+    # logs: -
     def __init__(
         self,
         *,
@@ -98,19 +194,21 @@ class OpenHandsDriver(BaseDriver):
         self._cli_mode = cli_mode
         self._tools = tools
 
-    # SEM_BEGIN orchestrator_v1.openhands_driver.run_task:v1
+    # SEM_END orchestrator_v1.openhands_driver.openhands_driver.__init__:v1
+
+    # SEM_BEGIN orchestrator_v1.openhands_driver.openhands_driver.run_task:v1
     # type: METHOD
-# use_case: Runs a single TaskUnit step through the real OpenHands agent server.
-# feature:
-#   - Phase 3 uses the same TaskUnit contract but the execution backend is real
+    # use_case: Runs a single TaskUnit step through the real OpenHands agent server.
+    # feature:
+    #   - Phase 3 uses the same TaskUnit contract but the execution backend is real
     #   - orchestrator/config/phases_and_roles.yaml -> runtime.openhands + per-step model
-# pre:
-#   - request.prompt is not empty
-#   - llm_api_key is configured
-# post:
-#   - returns a DriverResult with status, payload, and conversation_id
-# invariant:
-#   - graph contract does not change due to the selected runtime driver
+    # pre:
+    #   - request.prompt is not empty
+    #   - llm_api_key is configured
+    # post:
+    #   - returns a DriverResult with status, payload, and conversation_id
+    # invariant:
+    #   - graph contract does not change due to the selected runtime driver
     # modifies (internal):
     #   - external.openhands_server
     # emits (external):
@@ -136,6 +234,14 @@ class OpenHandsDriver(BaseDriver):
         )
 
         # === PRE[0]: request.prompt not empty ===
+        logger.info(
+            "[OpenHandsDriver][run_task][PreCheck] trace_id=%s | "
+            "Checking request.prompt is not empty. phase=%s, role_dir=%s, sub_role=%s",
+            trace_id,
+            request.phase_id,
+            request.role_dir,
+            request.sub_role,
+        )
         if not request.prompt.strip():
             logger.warning(
                 "[OpenHandsDriver][run_task][ErrorHandled][ERR:PRECONDITION] trace_id=%s | "
@@ -175,6 +281,7 @@ class OpenHandsDriver(BaseDriver):
             events = self._api.search_events(
                 handle.conversation_id,
                 limit=OPENHANDS_EVENT_SEARCH_LIMIT_MAX,
+                trace_id=trace_id,
             )
             text_fragments = _extract_texts({"state": state, "events": events})
             raw_text = "\n\n".join(text_fragments).strip()
@@ -216,4 +323,7 @@ class OpenHandsDriver(BaseDriver):
             conversation_id=handle.conversation_id,
         )
 
-    # SEM_END orchestrator_v1.openhands_driver.run_task:v1
+    # SEM_END orchestrator_v1.openhands_driver.openhands_driver.run_task:v1
+
+
+# SEM_END orchestrator_v1.openhands_driver.openhands_driver:v1

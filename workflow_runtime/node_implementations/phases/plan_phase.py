@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import logging
-
 from workflow_runtime.graph_compiler.state_schema import (
     PhaseId,
     PipelineState,
@@ -13,10 +11,11 @@ from workflow_runtime.graph_compiler.state_schema import (
 )
 from workflow_runtime.graph_compiler.yaml_manifest_parser import PhaseRuntimeConfig
 from workflow_runtime.integrations.observability import ensure_trace_id
+from workflow_runtime.integrations.runtime_logging import get_logger
 from workflow_runtime.node_implementations.task_unit import TaskUnitRunner
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 # SEM_BEGIN orchestrator_v1.plan_phase._merge_plan:v1
