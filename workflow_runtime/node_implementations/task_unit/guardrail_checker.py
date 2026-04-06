@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from workflow_runtime.graph_compiler.state_schema import PipelineStatus, SubRole
@@ -118,6 +119,93 @@ def _required_keys(phase_id: str, step_name: SubRole) -> list[str]:
 # SEM_END orchestrator_v1.guardrail_checker._required_keys:v1
 
 
+# SEM_BEGIN orchestrator_v1.guardrail_checker._extract_unchecked_boxes:v1
+# type: METHOD
+# use_case: Extracts all unchecked markdown checklist lines from one task artifact.
+# feature:
+#   - Checklist guardrail must validate real task memory markdown instead of a synthetic boolean flag
+#   - Task card 2026-03-24_1800__multi-agent-system-design, D9
+# pre:
+#   - path points to a markdown artifact when it exists
+# post:
+#   - returns all lines that still contain unchecked checklist items
+# invariant:
+#   - filesystem is accessed in readonly mode
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   -
+# depends:
+#   - Path.read_text
+# sft: read one markdown task artifact and collect unchecked checklist lines for guardrail validation
+# idempotent: true
+# logs: -
+def _extract_unchecked_boxes(path: Path) -> list[str]:
+    if not path.exists() or not path.is_file():
+        return []
+    unchecked: list[str] = []
+    for raw_line in path.read_text().splitlines():
+        stripped = raw_line.strip()
+        if stripped.startswith("- [ ]") or stripped.startswith("* [ ]"):
+            unchecked.append(stripped)
+    return unchecked
+
+
+# SEM_END orchestrator_v1.guardrail_checker._extract_unchecked_boxes:v1
+
+
+# SEM_BEGIN orchestrator_v1.guardrail_checker._check_task_artifact_checklist:v1
+# type: METHOD
+# use_case: Validates whether task/subtask markdown artifacts still contain unchecked checklist items.
+# feature:
+#   - Runtime checklist enforcement must operate on real TASK.md and subtask cards
+#   - Task card 2026-03-24_1800__multi-agent-system-design, D9
+# pre:
+#   -
+# post:
+#   - returns warning messages for missing artifacts or open checklist items
+# invariant:
+#   - task_context is not mutated
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   -
+# depends:
+#   - _extract_unchecked_boxes
+# sft: validate task and subtask markdown artifacts for unresolved checklist items
+# idempotent: true
+# logs: -
+def _check_task_artifact_checklist(task_context: dict[str, Any]) -> list[str]:
+    warnings: list[str] = []
+    task_card_path = str(task_context.get("task_card_path") or "").strip()
+    subtask_card_path = str(task_context.get("subtask_card_path") or "").strip()
+    artifact_paths: list[tuple[str, Path]] = []
+    if subtask_card_path and Path(subtask_card_path).exists():
+        artifact_paths = [("subtask_card", Path(subtask_card_path))]
+    elif task_card_path and Path(task_card_path).exists():
+        artifact_paths = [("task_card", Path(task_card_path))]
+
+    if not artifact_paths:
+        return ["Checklist guardrail requires an existing task_card_path or subtask_card_path"]
+
+    for label, path in artifact_paths:
+        unchecked = _extract_unchecked_boxes(path)
+        if unchecked:
+            preview = "; ".join(unchecked[:3])
+            suffix = " ..." if len(unchecked) > 3 else ""
+            warnings.append(
+                f"Unchecked checklist items remain in {label}={path}: {preview}{suffix}"
+            )
+    return warnings
+
+
+# SEM_END orchestrator_v1.guardrail_checker._check_task_artifact_checklist:v1
+
+
 # SEM_BEGIN orchestrator_v1.guardrail_checker.run_guardrails:v1
 # type: METHOD
 # use_case: Applies a simple set of V1 guardrails to a TaskUnit step result.
@@ -163,6 +251,11 @@ def run_guardrails(
         len(guardrails),
     )
 
+    _KEY_ALIASES = {"verdict": "status", "response": "feedback", "review": "feedback", "result": "result"}
+    for alias, canonical in _KEY_ALIASES.items():
+        if alias in payload and canonical not in payload:
+            payload[canonical] = payload[alias]
+
     for guardrail_name in guardrails:
         if guardrail_name in {"ensure_required_fields", "ensure_status_field", "ensure_feedback_field"}:
             for key in _required_keys(phase_id, step_name):
@@ -193,8 +286,8 @@ def run_guardrails(
                 ]:
                     if key not in structured_output:
                         warnings.append(f"structured_output missing key: {key}")
-        elif guardrail_name == "ensure_checklist" and task_context.get("checklist_ok") is False:
-            warnings.append("Checklist is not completed")
+        elif guardrail_name == "ensure_checklist":
+            warnings.extend(_check_task_artifact_checklist(task_context))
         elif guardrail_name == "ensure_tests_summary" and not payload.get("tests_passed") and not payload.get("result"):
             warnings.append("Tester payload must include tests summary")
 

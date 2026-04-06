@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from lmnr import observe
+
 from workflow_runtime.graph_compiler.state_schema import (
     PhaseId,
     PipelineState,
@@ -12,6 +14,7 @@ from workflow_runtime.graph_compiler.state_schema import (
 from workflow_runtime.graph_compiler.yaml_manifest_parser import PhaseRuntimeConfig
 from workflow_runtime.integrations.observability import ensure_trace_id
 from workflow_runtime.integrations.runtime_logging import get_logger
+from workflow_runtime.integrations.tasks_storage import build_task_artifact_context, sync_plan_to_task_artifacts
 from workflow_runtime.node_implementations.task_unit import TaskUnitRunner
 
 
@@ -54,6 +57,12 @@ def _merge_plan(existing_plan: list[SubtaskState], planned_items: list[dict]) ->
             existing.description = str(item["description"])
             existing.dependencies = list(item.get("dependencies", []))
             existing.max_retries = int(item.get("max_retries", existing.max_retries))
+            if existing.status != SubtaskStatus.DONE:
+                existing.status = SubtaskStatus.PENDING
+                existing.structured_output = None
+                existing.reviewer_feedback = None
+                existing.tester_result = None
+                existing.escalation_reason = None
             merged.append(existing)
             continue
         merged.append(
@@ -99,6 +108,7 @@ def _merge_plan(existing_plan: list[SubtaskState], planned_items: list[dict]) ->
 # sft: run the planning phase and merge the new DAG plan with existing completed subtasks
 # idempotent: false
 # logs: query: PlanPhase trace_id
+@observe(name="phase_plan")
 def run_plan_phase(
     state: PipelineState,
     *,
@@ -117,6 +127,12 @@ def run_plan_phase(
     )
 
     existing_plan = list(state.get("plan", []))
+    task_artifact_context = build_task_artifact_context(
+        state.get("task_id"),
+        task_dir_path=state.get("task_dir_path"),
+        task_card_path=state.get("task_card_path"),
+        openhands_conversations_dir=state.get("openhands_conversations_dir"),
+    )
     result = task_unit_runner.run(
         phase_id=PhaseId.PLAN,
         role_dir=phase_config.role_dir or "supervisor",
@@ -125,6 +141,11 @@ def run_plan_phase(
             "task_id": state.get("task_id"),
             "user_request": state.get("user_request"),
             "current_state": state.get("current_state", {}),
+            "source_workspace_root": state.get("workspace_root", ""),
+            "task_worktree_root": state.get("task_worktree_root", ""),
+            "methodology_root_runtime": state.get("methodology_root_runtime", ""),
+            "methodology_agents_entrypoint": state.get("methodology_agents_entrypoint", ""),
+            **task_artifact_context,
             "existing_plan": [
                 {
                     "id": subtask.id,
@@ -136,7 +157,7 @@ def run_plan_phase(
                 for subtask in existing_plan
             ],
         },
-        workspace_root=state["workspace_root"],
+        working_dir=state["task_worktree_root"],
         metadata={"task_id": state.get("task_id"), "phase": PhaseId.PLAN},
         trace_id=trace_id,
     )
@@ -152,6 +173,16 @@ def run_plan_phase(
     }
     if result.status == PipelineStatus.PASS:
         updates["plan"] = _merge_plan(existing_plan, list(result.payload.get("plan", [])))
+        sync_plan_to_task_artifacts(
+            task_context={
+                "task_id": state.get("task_id"),
+                "user_request": state.get("user_request"),
+                "source_workspace_root": state.get("workspace_root", ""),
+                "task_worktree_root": state.get("task_worktree_root", ""),
+                **task_artifact_context,
+            },
+            plan=list(updates["plan"]),
+        )
     if result.human_question:
         updates["pending_human_input"] = result.human_question
     logger.info(

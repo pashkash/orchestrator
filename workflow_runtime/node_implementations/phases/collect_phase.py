@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from lmnr import observe
+
 from workflow_runtime.graph_compiler.state_schema import PhaseId, PipelineState, PipelineStatus
 from workflow_runtime.graph_compiler.yaml_manifest_parser import PhaseRuntimeConfig
 from workflow_runtime.integrations.observability import ensure_trace_id
@@ -35,6 +37,7 @@ logger = get_logger(__name__)
 # sft: run the collect phase and persist the current environment snapshot in pipeline state
 # idempotent: false
 # logs: query: CollectPhase trace_id
+@observe(name="phase_collect")
 def run_collect_phase(
     state: PipelineState,
     *,
@@ -60,8 +63,15 @@ def run_collect_phase(
             "task_id": state.get("task_id"),
             "user_request": state.get("user_request"),
             "current_state": state.get("current_state", {}),
+            "source_workspace_root": state.get("workspace_root", ""),
+            "task_worktree_root": state.get("task_worktree_root", ""),
+            "task_dir_path": state.get("task_dir_path", ""),
+            "task_card_path": state.get("task_card_path", ""),
+            "openhands_conversations_dir": state.get("openhands_conversations_dir", ""),
+            "methodology_root_runtime": state.get("methodology_root_runtime", ""),
+            "methodology_agents_entrypoint": state.get("methodology_agents_entrypoint", ""),
         },
-        workspace_root=state["workspace_root"],
+        working_dir=state["task_worktree_root"],
         metadata={"task_id": state.get("task_id"), "phase": PhaseId.COLLECT},
         trace_id=trace_id,
     )

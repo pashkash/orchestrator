@@ -6,6 +6,7 @@ import re
 from typing import Any
 
 import yaml
+from lmnr import observe
 
 from workflow_runtime.agent_drivers.base_driver import BaseDriver, DriverRequest, DriverResult
 from workflow_runtime.graph_compiler.state_schema import PipelineStatus, SubRole
@@ -13,8 +14,11 @@ from workflow_runtime.integrations.observability import ensure_trace_id
 from workflow_runtime.integrations.openhands_http_api import OpenHandsHttpApi
 from workflow_runtime.integrations.openhands_runtime import (
     OPENHANDS_EVENT_SEARCH_LIMIT_MAX,
+    OpenHandsExecutionStatus,
+    normalize_openhands_execution_status,
 )
 from workflow_runtime.integrations.runtime_logging import get_logger
+from workflow_runtime.integrations.tasks_storage import persist_openhands_conversation_artifact
 
 
 logger = get_logger(__name__)
@@ -61,6 +65,44 @@ def _extract_texts(node: Any) -> list[str]:
 # SEM_END orchestrator_v1.openhands_driver._extract_texts:v1
 
 
+# SEM_BEGIN orchestrator_v1.openhands_driver._extract_agent_reply_texts:v1
+# type: METHOD
+# use_case: Extracts text only from real assistant replies and finish messages in OpenHands events.
+# feature:
+#   - Prevents payload parsing from accidentally consuming system prompts tool schemas and user examples
+# pre:
+#   - events is a list of OpenHands event dicts
+# post:
+#   - returns text fragments only from assistant llm messages or explicit finish messages
+# invariant:
+#   - user/system messages are excluded
+# sft: extract only real assistant reply texts and finish messages from OpenHands events, excluding system prompts
+# idempotent: true
+# logs: -
+def _extract_agent_reply_texts(events: list[dict[str, Any]] | Any) -> list[str]:
+    if not isinstance(events, list):
+        return _extract_texts(events)
+    texts: list[str] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        llm_message = event.get("llm_message")
+        if isinstance(llm_message, dict):
+            llm_role = str(llm_message.get("role", "")).lower()
+            if llm_role == "assistant":
+                texts.extend(_extract_texts(llm_message.get("content", [])))
+
+        action = event.get("action")
+        if isinstance(action, dict):
+            action_message = action.get("message")
+            if isinstance(action_message, str) and action_message.strip():
+                texts.append(action_message)
+    return texts
+
+
+# SEM_END orchestrator_v1.openhands_driver._extract_agent_reply_texts:v1
+
+
 # SEM_BEGIN orchestrator_v1.openhands_driver._coerce_payload:v1
 # type: METHOD
 # use_case: Extracts the first valid YAML object from the OpenHands agent text response.
@@ -69,7 +111,7 @@ def _extract_texts(node: Any) -> list[str]:
 # pre:
 #   - raw_text is not empty
 # post:
-#   - returns a parsed dict from the last YAML block
+#   - returns a parsed dict from the last YAML block or None when parsing fails
 # invariant:
 #   - raw_text is not mutated
 # modifies (internal):
@@ -77,13 +119,13 @@ def _extract_texts(node: Any) -> list[str]:
 # emits (external):
 #   -
 # errors:
-#   - ValueError: no YAML block found
+#   -
 # depends:
 #   - yaml.safe_load
-# sft: extract the last valid YAML mapping from OpenHands agent raw text response
+# sft: extract the last valid YAML mapping from OpenHands agent raw text response and return None on parse failure
 # idempotent: true
 # logs: -
-def _coerce_payload(raw_text: str) -> dict[str, Any]:
+def _coerce_payload(raw_text: str) -> dict[str, Any] | None:
     blocks = _YAML_BLOCK_RE.findall(raw_text)
     candidates = list(reversed(blocks)) if blocks else [raw_text]
     for candidate in candidates:
@@ -93,7 +135,7 @@ def _coerce_payload(raw_text: str) -> dict[str, Any]:
             continue
         if isinstance(loaded, dict):
             return loaded
-    raise ValueError("No YAML object could be parsed from OpenHands output")
+    return None
 
 
 # SEM_END orchestrator_v1.openhands_driver._coerce_payload:v1
@@ -131,6 +173,41 @@ def _status_for_parse_failure(sub_role: SubRole) -> PipelineStatus:
 
 
 # SEM_END orchestrator_v1.openhands_driver._status_for_parse_failure:v1
+
+
+_STATUS_ALIASES: dict[str, PipelineStatus] = {
+    "done": PipelineStatus.PASS,
+    "success": PipelineStatus.PASS,
+    "ok": PipelineStatus.PASS,
+    "completed": PipelineStatus.PASS,
+    "ready": PipelineStatus.PASS,
+    "finished": PipelineStatus.PASS,
+    "failed": PipelineStatus.NEEDS_FIX_EXECUTOR,
+    "error": PipelineStatus.NEEDS_FIX_EXECUTOR,
+    "fix": PipelineStatus.NEEDS_FIX_EXECUTOR,
+}
+
+
+def _normalize_status(raw_status: str, sub_role: SubRole) -> PipelineStatus:
+    """Normalize agent-returned status string into a valid PipelineStatus."""
+    upper = raw_status.strip().upper()
+    try:
+        return PipelineStatus(upper)
+    except ValueError:
+        pass
+    alias = _STATUS_ALIASES.get(raw_status.strip().lower())
+    if alias:
+        logger.info(
+            "[OpenHandsDriver][_normalize_status] Mapped alias '%s' -> %s",
+            raw_status,
+            alias,
+        )
+        return alias
+    logger.warning(
+        "[OpenHandsDriver][_normalize_status] Unknown status '%s', falling back to NEEDS_FIX",
+        raw_status,
+    )
+    return _status_for_parse_failure(sub_role)
 
 
 # SEM_BEGIN orchestrator_v1.openhands_driver.openhands_driver:v1
@@ -183,7 +260,7 @@ class OpenHandsDriver(BaseDriver):
         self,
         *,
         api: OpenHandsHttpApi,
-        llm_api_key: str,
+        llm_api_key: str | None,
         llm_base_url: str,
         cli_mode: bool,
         tools: list[str],
@@ -220,6 +297,7 @@ class OpenHandsDriver(BaseDriver):
     # sft: execute a task unit step through OpenHands agent server and parse the YAML result
     # idempotent: false
     # logs: query: OpenHands conversation events and execution status
+    @observe(name="openhands_run_task")
     def run_task(self, request: DriverRequest) -> DriverResult:
         trace_id = ensure_trace_id(request.metadata.get("trace_id"))
 
@@ -258,24 +336,24 @@ class OpenHandsDriver(BaseDriver):
                 "discriminator": "Agent",
                 "llm": {
                     "model": request.model,
-                    "api_key": self._llm_api_key,
                     "base_url": self._llm_base_url,
+                    **({"api_key": self._llm_api_key} if self._llm_api_key else {}),
                 },
                 "tools": [{"name": tool_name} for tool_name in self._tools],
                 "cli_mode": self._cli_mode,
             },
-            "workspace": {"working_dir": request.workspace_root},
+            "workspace": {"working_dir": request.working_dir},
             "initial_message": {
                 "role": "user",
                 "content": [{"type": "text", "text": request.prompt}],
-                "run": True,
+                "run": False,
             },
         }
 
         try:
             handle = self._api.create_conversation(payload, trace_id=trace_id)
-            initial_status = str(handle.state.get("execution_status", "")).upper()
-            if initial_status in {"", "IDLE"}:
+            initial_status = normalize_openhands_execution_status(handle.state.get("execution_status"))
+            if initial_status in {None, OpenHandsExecutionStatus.IDLE}:
                 self._api.run_conversation(handle.conversation_id, trace_id=trace_id)
             state = self._api.wait_until_finished(handle.conversation_id, trace_id=trace_id)
             events = self._api.search_events(
@@ -283,10 +361,72 @@ class OpenHandsDriver(BaseDriver):
                 limit=OPENHANDS_EVENT_SEARCH_LIMIT_MAX,
                 trace_id=trace_id,
             )
-            text_fragments = _extract_texts({"state": state, "events": events})
-            raw_text = "\n\n".join(text_fragments).strip()
-            parsed_payload = _coerce_payload(raw_text)
-            status = PipelineStatus(str(parsed_payload.get("status") or PipelineStatus.PASS))
+
+            normalized_execution_status = normalize_openhands_execution_status(
+                state.get("execution_status")
+            )
+            execution_status = (
+                normalized_execution_status.value.lower()
+                if normalized_execution_status is not None
+                else str(state.get("execution_status", "")).strip().lower()
+            )
+
+            event_items = events.get("items", events) if isinstance(events, dict) else events
+            agent_texts = _extract_agent_reply_texts(event_items)
+            raw_text = "\n\n".join(agent_texts).strip() if agent_texts else ""
+
+            if normalized_execution_status == OpenHandsExecutionStatus.ERROR:
+                logger.warning(
+                    "[OpenHandsDriver][run_task][GuardTriggered] trace_id=%s | "
+                    "OpenHands execution_status=error. Forcing NEEDS_FIX. "
+                    "phase=%s, sub_role=%s, conversation_id=%s",
+                    trace_id,
+                    request.phase_id,
+                    request.sub_role,
+                    handle.conversation_id,
+                )
+                status = _status_for_parse_failure(request.sub_role)
+                parsed_payload = {
+                    "status": str(status),
+                    "warnings": [
+                        f"OpenHands execution_status=error (conversation_id={handle.conversation_id})"
+                    ],
+                    "execution_status": execution_status,
+                }
+            elif not raw_text:
+                status = _status_for_parse_failure(request.sub_role)
+                parsed_payload = {
+                    "status": str(status),
+                    "warnings": ["OpenHands returned no parseable text output"],
+                }
+            else:
+                parsed_payload = _coerce_payload(raw_text)
+                if parsed_payload is None:
+                    status = _status_for_parse_failure(request.sub_role)
+                    parsed_payload = {
+                        "status": str(status),
+                        "warnings": [
+                            "OpenHands returned non-YAML final output; final assistant reply must be exactly one YAML block",
+                        ],
+                    }
+                else:
+                    if "verdict" in parsed_payload and "status" not in parsed_payload:
+                        parsed_payload["status"] = parsed_payload["verdict"]
+                    raw_status = str(parsed_payload.get("status") or PipelineStatus.PASS)
+                    status = _normalize_status(raw_status, request.sub_role)
+
+            persist_openhands_conversation_artifact(
+                task_context=request.task_context,
+                phase_id=str(request.phase_id),
+                role_dir=request.role_dir,
+                sub_role=str(request.sub_role),
+                conversation_id=handle.conversation_id,
+                trace_id=trace_id,
+                state=state,
+                events=events,
+                raw_text=raw_text,
+                parsed_payload=parsed_payload,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "[OpenHandsDriver][run_task][ErrorHandled][ERR:EXTERNAL] trace_id=%s | "
@@ -298,13 +438,6 @@ class OpenHandsDriver(BaseDriver):
                 str(exc),
             )
             raise RuntimeError(f"OpenHands driver failed: {exc}") from exc
-
-        if not raw_text:
-            status = _status_for_parse_failure(request.sub_role)
-            parsed_payload = {
-                "status": status,
-                "warnings": ["OpenHands returned no parseable text output"],
-            }
 
         logger.info(
             "[OpenHandsDriver][run_task][StepComplete] trace_id=%s | "

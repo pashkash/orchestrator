@@ -35,7 +35,7 @@ logger = get_logger(__name__)
 #   - Task card 2026-03-24_1800__multi-agent-system-design, D4-D5
 # pre:
 #   - driver_mode is supported
-#   - For openhands, base_url_env and llm_api_key_env are set
+#   - For openhands, base_url resolves from env or runtime config default
 # post:
 #   - returns a ready BaseDriver
 # invariant:
@@ -45,7 +45,7 @@ logger = get_logger(__name__)
 # emits (external):
 #   -
 # errors:
-#   - ValueError: pre[0] or pre[1] violated
+#   - ValueError: pre[0] violated
 # depends:
 #   - MockDriver
 #   - OpenHandsDriver
@@ -85,11 +85,11 @@ def _build_driver(driver_mode: DriverMode, runtime_config: RuntimeConfig) -> Bas
 
     base_url_env = runtime_config.openhands["base_url_env"]
     llm_api_key_env = runtime_config.openhands["llm_api_key_env"]
-    base_url = os.getenv(base_url_env)
+    base_url = os.getenv(base_url_env) or str(runtime_config.openhands.get("base_url_default", "")).strip()
     llm_api_key = os.getenv(llm_api_key_env)
     logger.info(
         "[LangGraphBuilder][_build_driver][PreCheck] trace_id=%s | "
-        "Checking OpenHands env vars. base_url_env=%s, llm_api_key_env=%s",
+        "Checking OpenHands runtime config. base_url_env=%s, llm_api_key_env=%s",
         trace_id,
         base_url_env,
         llm_api_key_env,
@@ -101,20 +101,14 @@ def _build_driver(driver_mode: DriverMode, runtime_config: RuntimeConfig) -> Bas
             trace_id,
             base_url_env,
         )
-        raise ValueError(f"Missing required env var: {base_url_env}")
-    if not llm_api_key:
-        logger.error(
-            "[LangGraphBuilder][_build_driver][ErrorHandled][ERR:PRECONDITION] trace_id=%s | "
-            "Missing OpenHands API key env var. env=%s",
-            trace_id,
-            llm_api_key_env,
-        )
-        raise ValueError(f"Missing required env var: {llm_api_key_env}")
+        raise ValueError(f"Missing OpenHands base URL: env {base_url_env} or runtime.openhands.base_url_default")
 
     api = OpenHandsHttpApi(
         base_url=base_url,
         timeout_seconds=int(runtime_config.openhands["timeout_seconds"]),
         poll_interval_seconds=int(runtime_config.openhands["poll_interval_seconds"]),
+        max_poll_interval_seconds=int(runtime_config.openhands["max_poll_interval_seconds"]),
+        poll_log_every_n_attempts=int(runtime_config.openhands["poll_log_every_n_attempts"]),
     )
     driver = OpenHandsDriver(
         api=api,

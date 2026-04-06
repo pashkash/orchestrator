@@ -206,7 +206,7 @@ class PipelineStepConfig:
 @dataclass(frozen=True, slots=True)
 class PipelineConfig:
     executor: PipelineStepConfig
-    reviewer: PipelineStepConfig
+    reviewer: PipelineStepConfig | None
     tester: PipelineStepConfig | None
 
 
@@ -306,6 +306,8 @@ class PhaseRuntimeConfig:
 class RuntimeConfig:
     docs_root_alias: str
     docs_root_default: str
+    methodology_root_default: str
+    methodology_agents_entrypoint: str
     prompts_root: str
     workspace_root_default: str
     tasks_root_default: str
@@ -411,10 +413,11 @@ def _parse_step(raw: dict) -> PipelineStepConfig:
 def _parse_pipeline(raw: dict | None) -> PipelineConfig | None:
     if raw is None:
         return None
+    reviewer_raw = raw.get("reviewer")
     tester_raw = raw.get("tester")
     return PipelineConfig(
         executor=_parse_step(raw["executor"]),
-        reviewer=_parse_step(raw["reviewer"]),
+        reviewer=_parse_step(reviewer_raw) if reviewer_raw else None,
         tester=_parse_step(tester_raw) if tester_raw else None,
     )
 
@@ -568,6 +571,14 @@ def load_runtime_config(path: Path) -> RuntimeConfig:
     config = RuntimeConfig(
         docs_root_alias=raw["runtime"]["docs_root_alias"],
         docs_root_default=raw["runtime"]["docs_root_default"],
+        methodology_root_default=raw["runtime"].get(
+            "methodology_root_default",
+            raw["runtime"]["docs_root_default"],
+        ),
+        methodology_agents_entrypoint=raw["runtime"].get(
+            "methodology_agents_entrypoint",
+            "AGENTS.md",
+        ),
         prompts_root=raw["runtime"]["prompts_root"],
         workspace_root_default=raw["runtime"]["workspace_root_default"],
         tasks_root_default=raw["runtime"]["tasks_root_default"],

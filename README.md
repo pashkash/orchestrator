@@ -112,9 +112,9 @@ sequenceDiagram
 - `docs/common/roles/flow_design.md`  
 - `docs/common/roles/{role}/role.yaml`  
 - `docs/common/roles/{role}/{executor,reviewer,tester}.md`  
-- `docs/common/roles/_shared/*.md`  
+- `docs/common/roles/_shared/*.md` — общие правила для domain-ролей; агент читает их по явным ссылкам из своего `executor.md` / `reviewer.md` / `tester.md`, оркестратор **не** подмешивает эти файлы в промпт автоматически  
 
-Prompt and design-document locations are resolved from `config/phases_and_roles.yaml`.
+Prompt paths are resolved from `config/phases_and_roles.yaml`. `compose_prompt` appends only **Runtime Task Context** (ключи из состояния пайплайна) and **Output Contract** (минимальные ключи YAML для парсера драйвера).
 
 **Design artifacts (V1 chain)**
 
@@ -206,7 +206,7 @@ phases:
         prompt:
           sub_role: executor
           path: "Technical Docs/common/roles/{role_dir}/executor.md"
-        model: "openhands/claude-sonnet-4-5-20250929"
+        model: "openrouter/z-ai/glm-5"
         max_retries: 3
         guardrails:
           - ensure_structured_output
@@ -216,7 +216,7 @@ phases:
         prompt:
           sub_role: reviewer
           path: "Technical Docs/common/roles/{role_dir}/reviewer.md"
-        model: "openhands/claude-sonnet-4-5-20250929"
+        model: "openrouter/z-ai/glm-5"
         max_retries: 2
         guardrails:
           - ensure_status_field
@@ -226,7 +226,7 @@ phases:
         prompt:
           sub_role: tester
           path: "Technical Docs/common/roles/{role_dir}/tester.md"
-        model: "openhands/gpt-5-mini-2025-08-07"
+        model: "openrouter/z-ai/glm-5"
         max_retries: 1
         guardrails:
           - ensure_status_field

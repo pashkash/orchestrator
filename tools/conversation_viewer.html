@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>OpenHands Conversation Viewer</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#c9d1d9;--text-dim:#8b949e;--accent:#58a6ff;--green:#3fb950;--red:#f85149;--yellow:#d29922;--agent:#1f6feb;--user:#238636;--env:#8957e5}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;line-height:1.5;padding:1rem}
+h1{color:#fff;font-size:1.4rem;margin-bottom:1rem}
+.controls{display:flex;gap:.5rem;margin-bottom:1rem;flex-wrap:wrap;align-items:center}
+.controls input,.controls select{background:var(--card);border:1px solid var(--border);color:var(--text);padding:.4rem .6rem;border-radius:6px;font-size:.85rem}
+.controls input{flex:1;min-width:200px}
+.controls button{background:var(--agent);color:#fff;border:none;padding:.4rem 1rem;border-radius:6px;cursor:pointer;font-size:.85rem}
+.controls button:hover{opacity:.85}
+#status{font-size:.8rem;color:var(--text-dim)}
+.conv-list{display:flex;gap:.4rem;flex-wrap:wrap;margin-bottom:1rem}
+.conv-chip{background:var(--card);border:1px solid var(--border);padding:.3rem .6rem;border-radius:20px;font-size:.75rem;cursor:pointer;transition:all .15s}
+.conv-chip:hover,.conv-chip.active{border-color:var(--accent);color:var(--accent)}
+.conv-chip .phase{color:var(--yellow);margin-right:.3rem}
+.conv-chip .role{color:var(--green)}
+.timeline{max-width:900px}
+.event{border-left:3px solid var(--border);padding:.6rem 1rem;margin-bottom:.3rem;border-radius:0 6px 6px 0;background:var(--card);position:relative}
+.event.agent{border-left-color:var(--agent)}
+.event.user{border-left-color:var(--user)}
+.event.environment{border-left-color:var(--env)}
+.event-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:.3rem}
+.event-kind{font-size:.75rem;font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+.event-kind.agent{color:var(--accent)}
+.event-kind.user{color:var(--green)}
+.event-kind.environment{color:var(--env)}
+.event-time{font-size:.7rem;color:var(--text-dim)}
+.event-content{font-size:.85rem;white-space:pre-wrap;word-break:break-word}
+.thought{color:var(--yellow);font-style:italic;margin-bottom:.3rem;font-size:.8rem}
+.cmd{background:#1a1e24;border:1px solid var(--border);border-radius:4px;padding:.4rem .6rem;font-family:'SF Mono',Menlo,monospace;font-size:.8rem;margin:.3rem 0;overflow-x:auto}
+.cmd-label{color:var(--text-dim);font-size:.7rem;text-transform:uppercase;margin-bottom:.2rem}
+.output{background:#12151a;border:1px solid var(--border);border-radius:4px;padding:.4rem .6rem;font-family:'SF Mono',Menlo,monospace;font-size:.78rem;margin:.3rem 0;max-height:300px;overflow-y:auto;color:var(--text-dim)}
+.error-output{border-color:var(--red);color:var(--red)}
+.finish{border-left-color:var(--green);background:#0d1f0d}
+.finish .event-kind{color:var(--green)}
+.system-prompt{max-height:200px;overflow-y:auto;font-size:.78rem;color:var(--text-dim)}
+.meta-badge{display:inline-block;background:var(--border);color:var(--text-dim);padding:.1rem .4rem;border-radius:3px;font-size:.7rem;margin-right:.3rem}
+.collapsible{cursor:pointer;user-select:none}
+.collapsible::before{content:'▸ ';color:var(--text-dim)}
+.collapsible.open::before{content:'▾ '}
+.collapsed{display:none}
+.filter-row{display:flex;gap:.5rem;align-items:center;margin-bottom:.5rem}
+.filter-row label{font-size:.8rem;color:var(--text-dim)}
+.filter-row input[type=checkbox]{accent-color:var(--accent)}
+</style>
+</head>
+<body>
+
+<h1>OpenHands Conversation Viewer</h1>
+
+<div class="controls">
+  <input id="serverUrl" value="" placeholder="Agent Server URL (empty = same origin)"/>
+  <button onclick="loadConversations()">Load</button>
+  <span id="status"></span>
+</div>
+
+<div class="filter-row">
+  <label><input type="checkbox" id="showSystem" checked/> System</label>
+  <label><input type="checkbox" id="showState"/> State Updates</label>
+  <label><input type="checkbox" id="showThinking"/> Thinking</label>
+  <label><input type="checkbox" id="showActions" checked/> Actions</label>
+  <label><input type="checkbox" id="showObs" checked/> Observations</label>
+  <label><input type="checkbox" id="showMessages" checked/> Messages</label>
+</div>
+
+<div id="convList" class="conv-list"></div>
+<div id="timeline" class="timeline"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const status = msg => { $('#status').textContent = msg; };
+
+let conversationsMap = {};
+let orchestratorArtifacts = {};
+
+async function api(path) {
+  const base = ($('#serverUrl').value || window.location.origin).replace(/\/$/,'');
+  const r = await fetch(base + path);
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+  return r.json();
+}
+
+async function loadConversations() {
+  status('Loading...');
+  try {
+    const data = await api('/api/conversations/search?limit=100&sort_order=CREATED_AT_DESC');
+    const items = data.items || [];
+    conversationsMap = {};
+    items.forEach(c => conversationsMap[c.id] = c);
+
+    const listEl = $('#convList');
+    listEl.innerHTML = '';
+    items.forEach(c => {
+      const chip = document.createElement('div');
+      chip.className = 'conv-chip';
+      chip.dataset.id = c.id;
+      const st = c.execution_status || '?';
+      chip.innerHTML = `<span class="phase">${st}</span> ${c.id.slice(0,8)}…`;
+      chip.onclick = () => loadConversation(c.id);
+      listEl.appendChild(chip);
+    });
+    status(`${items.length} conversations`);
+  } catch(e) {
+    status('Error: ' + e.message);
+  }
+}
+
+async function loadConversation(cid) {
+  document.querySelectorAll('.conv-chip').forEach(c => c.classList.remove('active'));
+  const active = document.querySelector(`.conv-chip[data-id="${cid}"]`);
+  if (active) active.classList.add('active');
+
+  status(`Loading ${cid.slice(0,8)}…`);
+  const timeline = $('#timeline');
+  timeline.innerHTML = '';
+
+  try {
+    const events = await loadAllEvents(cid);
+
+    if (!events.length) {
+      timeline.innerHTML = '<div style="color:var(--text-dim)">No events found</div>';
+      status('No events');
+      return;
+    }
+
+    events.forEach(ev => {
+      const el = renderEvent(ev);
+      if (el) timeline.appendChild(el);
+    });
+    status(`${events.length} events for ${cid.slice(0,8)}…`);
+  } catch(e) {
+    status('Error: ' + e.message);
+    console.error(e);
+  }
+}
+
+async function loadAllEvents(cid) {
+  const all = [];
+  let pageId = null;
+  try {
+    for (let page = 0; page < 20; page++) {
+      let url = `/api/conversations/${cid}/events/search?limit=100`;
+      if (pageId) url += `&page_id=${encodeURIComponent(pageId)}`;
+      const data = await api(url);
+      const items = data.items || [];
+      all.push(...items);
+      pageId = data.next_page_id;
+      if (!pageId || items.length < 100) break;
+    }
+  } catch(e) {
+    console.error('loadAllEvents error:', e);
+  }
+  return all;
+}
+
+function renderEvent(ev) {
+  const kind = ev.kind || '?';
+  const source = ev.source || '?';
+  const showSystem = $('#showSystem').checked;
+  const showState = $('#showState').checked;
+  const showThinking = $('#showThinking').checked;
+  const showActions = $('#showActions').checked;
+  const showObs = $('#showObs').checked;
+  const showMessages = $('#showMessages').checked;
+
+  if (kind === 'SystemPromptEvent' && !showSystem) return null;
+  if (kind === 'ConversationStateUpdateEvent' && !showState) return null;
+  if (kind === 'ActionEvent' && ev.action?.kind === 'ThinkAction' && !showThinking) return null;
+  if (kind === 'ActionEvent' && !showActions) return null;
+  if (kind === 'ObservationEvent' && !showObs) return null;
+  if (kind === 'MessageEvent' && !showMessages) return null;
+
+  const div = document.createElement('div');
+  div.className = `event ${source}`;
+
+  const ts = ev.timestamp ? new Date(ev.timestamp).toLocaleTimeString() : '';
+  let label = kind.replace('Event','');
+
+  if (kind === 'ActionEvent' && ev.action) {
+    label = ev.action.kind || 'Action';
+    if (ev.action.kind === 'FinishAction') div.classList.add('finish');
+  }
+  if (kind === 'ObservationEvent' && ev.observation) {
+    label = 'Observation';
+    if (ev.tool_name) label += ` (${ev.tool_name})`;
+  }
+
+  let headerHtml = `<div class="event-header">
+    <span class="event-kind ${source}">${source} / ${label}</span>
+    <span class="event-time">${ts}</span>
+  </div>`;
+
+  let contentHtml = '';
+
+  if (kind === 'SystemPromptEvent') {
+    const text = ev.system_prompt?.text || JSON.stringify(ev.system_prompt).slice(0,500);
+    contentHtml = `<div class="collapsible" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('collapsed')">System Prompt</div><div class="system-prompt collapsed">${escHtml(text)}</div>`;
+  }
+
+  else if (kind === 'MessageEvent') {
+    const text = extractText(ev.llm_message?.content || ev.content);
+    contentHtml = `<div class="event-content">${escHtml(text.slice(0,2000))}</div>`;
+  }
+
+  else if (kind === 'ActionEvent' && ev.action) {
+    const a = ev.action;
+    if (ev.thought?.length) {
+      const t = ev.thought.map(p => p.text || '').join('\n');
+      if (t.trim()) contentHtml += `<div class="thought">${escHtml(t.slice(0,500))}</div>`;
+    }
+    if (ev.reasoning_content) {
+      contentHtml += `<div class="collapsible" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('collapsed')">Reasoning</div><div class="thought collapsed">${escHtml(String(ev.reasoning_content).slice(0,1000))}</div>`;
+    }
+
+    if (a.kind === 'TerminalAction') {
+      contentHtml += `<div class="cmd-label">command</div><div class="cmd">${escHtml(a.command || '')}</div>`;
+    } else if (a.kind === 'FileEditorAction') {
+      contentHtml += `<span class="meta-badge">${a.command || 'edit'}</span>`;
+      if (a.path) contentHtml += `<span class="meta-badge">${escHtml(a.path)}</span>`;
+      if (a.file_text) {
+        contentHtml += `<div class="collapsible" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('collapsed')">Content</div><div class="cmd collapsed">${escHtml(a.file_text.slice(0,2000))}</div>`;
+      }
+    } else if (a.kind === 'FinishAction') {
+      const msg = a.final_message || a.outputs?.content || a.message || '';
+      contentHtml += `<div class="event-content" style="color:var(--green)">${escHtml(typeof msg === 'string' ? msg.slice(0,2000) : JSON.stringify(msg).slice(0,2000))}</div>`;
+    } else if (a.kind === 'ThinkAction') {
+      const t = a.thought || '';
+      contentHtml += `<div class="thought">${escHtml(t.slice(0,1000))}</div>`;
+    } else {
+      contentHtml += `<div class="cmd">${escHtml(JSON.stringify(a, null, 2).slice(0,1000))}</div>`;
+    }
+  }
+
+  else if (kind === 'ObservationEvent' && ev.observation) {
+    const obs = ev.observation;
+    const text = extractText(obs.content);
+    const isErr = obs.is_error;
+    if (obs.command) contentHtml += `<div class="cmd-label">$ ${escHtml(obs.command)}</div>`;
+    contentHtml += `<div class="output ${isErr ? 'error-output' : ''}">${escHtml(text.slice(0,3000))}</div>`;
+    if (obs.exit_code !== undefined) contentHtml += `<span class="meta-badge">exit: ${obs.exit_code}</span>`;
+  }
+
+  else if (kind === 'ConversationStateUpdateEvent') {
+    contentHtml = `<span class="meta-badge">${escHtml(ev.key||'')}</span> = ${escHtml(String(ev.value||'').slice(0,200))}`;
+  }
+
+  else {
+    contentHtml = `<div class="cmd">${escHtml(JSON.stringify(ev, null, 2).slice(0,1000))}</div>`;
+  }
+
+  div.innerHTML = headerHtml + `<div class="event-content-wrap">${contentHtml}</div>`;
+  return div;
+}
+
+function extractText(content) {
+  if (!content) return '';
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content.map(p => (typeof p === 'string') ? p : (p.text || '')).join('\n');
+  }
+  return JSON.stringify(content);
+}
+
+function escHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+document.querySelectorAll('.filter-row input').forEach(cb => {
+  cb.onchange = () => {
+    const active = document.querySelector('.conv-chip.active');
+    if (active) loadConversation(active.dataset.id);
+  };
+});
+
+loadConversations();
+</script>
+</body>
+</html>

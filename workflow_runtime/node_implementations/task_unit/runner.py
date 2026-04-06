@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from lmnr import observe
+
 from workflow_runtime.agent_drivers.base_driver import BaseDriver, DriverResult
 from workflow_runtime.graph_compiler.state_schema import (
     FileChange,
@@ -16,6 +18,7 @@ from workflow_runtime.graph_compiler.state_schema import (
 from workflow_runtime.graph_compiler.yaml_manifest_parser import PipelineConfig
 from workflow_runtime.integrations.observability import ensure_trace_id
 from workflow_runtime.integrations.runtime_logging import get_logger
+from workflow_runtime.integrations.tasks_storage import sync_task_cards_from_structured_output
 from workflow_runtime.node_implementations.task_unit.executor_node import run_executor_step
 from workflow_runtime.node_implementations.task_unit.guardrail_checker import run_guardrails
 from workflow_runtime.node_implementations.task_unit.reviewer_node import run_reviewer_step
@@ -23,6 +26,12 @@ from workflow_runtime.node_implementations.task_unit.tester_node import run_test
 
 
 logger = get_logger(__name__)
+
+
+def _safe_review_feedback(reviewer_result: DriverResult | None) -> str | None:
+    if reviewer_result is None:
+        return None
+    return reviewer_result.payload.get("feedback")
 
 
 # SEM_BEGIN orchestrator_v1.task_unit_runner._normalize_status:v1
@@ -79,16 +88,44 @@ def _structured_output_from_payload(payload: dict[str, Any]) -> StructuredOutput
     raw_output = payload.get("structured_output")
     if not isinstance(raw_output, dict):
         return None
+    raw_status = str(raw_output.get("status", "")).strip().lower()
+    status_aliases = {
+        "done": StructuredOutputStatus.DONE,
+        "completed": StructuredOutputStatus.DONE,
+        "complete": StructuredOutputStatus.DONE,
+        "pass": StructuredOutputStatus.DONE,
+        "passed": StructuredOutputStatus.DONE,
+        "success": StructuredOutputStatus.DONE,
+        "ok": StructuredOutputStatus.DONE,
+        "finished": StructuredOutputStatus.DONE,
+        "failed": StructuredOutputStatus.FAILED,
+        "fail": StructuredOutputStatus.FAILED,
+        "error": StructuredOutputStatus.FAILED,
+        "escalated": StructuredOutputStatus.ESCALATED,
+        "escalate": StructuredOutputStatus.ESCALATED,
+        "blocked": StructuredOutputStatus.ESCALATED,
+        "cancelled": StructuredOutputStatus.CANCELLED,
+        "canceled": StructuredOutputStatus.CANCELLED,
+    }
+    normalized_status = (
+        status_aliases[raw_status]
+        if raw_status in status_aliases
+        else StructuredOutputStatus(raw_status)
+    )
     return StructuredOutput(
         task_id=str(raw_output["task_id"]),
         subtask_id=str(raw_output["subtask_id"]),
         role=str(raw_output["role"]),
-        status=StructuredOutputStatus(str(raw_output["status"])),
+        status=normalized_status,
         changes=[
             FileChange(
-                file=str(change["file"]),
-                type=str(change["type"]),
-                description=str(change["description"]),
+                file=str(change.get("file") or change.get("path")),
+                type=str(change.get("type") or change.get("action") or "modified"),
+                description=str(
+                    change.get("description")
+                    or f"{change.get('type') or change.get('action') or 'modified'} "
+                    f"{change.get('file') or change.get('path')}"
+                ),
             )
             for change in raw_output.get("changes", [])
         ],
@@ -187,10 +224,10 @@ class TaskUnitRunner:
         role_dir: str,
         pipeline: PipelineConfig,
         task_context: dict[str, Any],
-        workspace_root: str,
+        working_dir: str,
         metadata: dict[str, Any],
         trace_id: str,
-    ) -> DriverResult:
+    ) -> tuple[DriverResult, int]:
         last_result: DriverResult | None = None
         for attempt in range(1, pipeline.executor.max_retries + 1):
             logger.info(
@@ -208,11 +245,17 @@ class TaskUnitRunner:
                 role_dir=role_dir,
                 step_config=pipeline.executor,
                 task_context=task_context,
-                workspace_root=workspace_root,
+                working_dir=working_dir,
                 metadata={**metadata, "trace_id": trace_id, "attempt": attempt},
             )
             last_result = result
             status = _normalize_status(result.status)
+            structured_output = _structured_output_from_payload(result.payload)
+            if status == PipelineStatus.PASS and structured_output is not None:
+                sync_task_cards_from_structured_output(
+                    task_context={**task_context, "trace_id": trace_id},
+                    output=structured_output,
+                )
             guardrail_result = run_guardrails(
                 phase_id=phase_id,
                 step_name=SubRole.EXECUTOR,
@@ -222,20 +265,30 @@ class TaskUnitRunner:
                 trace_id=trace_id,
             )
             if status == PipelineStatus.PASS and guardrail_result.status == PipelineStatus.PASS:
-                return result
+                return result, attempt
             if attempt == pipeline.executor.max_retries or status not in {
                 PipelineStatus.PASS,
                 PipelineStatus.NEEDS_FIX_EXECUTOR,
             }:
-                return DriverResult(
-                    status=guardrail_result.status if status == PipelineStatus.PASS else status,
-                    payload={**result.payload, "warnings": guardrail_result.warnings or result.payload.get("warnings", [])},
-                    raw_text=result.raw_text,
-                    conversation_id=result.conversation_id,
+                return (
+                    DriverResult(
+                        status=guardrail_result.status if status == PipelineStatus.PASS else status,
+                        payload={
+                            **result.payload,
+                            "warnings": guardrail_result.warnings or result.payload.get("warnings", []),
+                        },
+                        raw_text=result.raw_text,
+                        conversation_id=result.conversation_id,
+                    ),
+                    attempt,
                 )
-        return last_result or DriverResult(
-            status=PipelineStatus.NEEDS_FIX_EXECUTOR,
-            payload={"warnings": ["Executor returned no result"]},
+        return (
+            last_result
+            or DriverResult(
+                status=PipelineStatus.NEEDS_FIX_EXECUTOR,
+                payload={"warnings": ["Executor returned no result"]},
+            ),
+            pipeline.executor.max_retries,
         )
 
     # SEM_END orchestrator_v1.task_unit_runner._run_executor_with_retries:v1
@@ -268,6 +321,7 @@ class TaskUnitRunner:
     # sft: execute the universal task unit with executor reviewer tester and simple guardrails
     # idempotent: false
     # logs: query: task unit trace_id and step attempts
+    @observe(name="task_unit_run")
     def run(
         self,
         *,
@@ -275,7 +329,7 @@ class TaskUnitRunner:
         role_dir: str,
         pipeline: PipelineConfig,
         task_context: dict[str, Any],
-        workspace_root: str,
+        working_dir: str,
         metadata: dict[str, Any],
         trace_id: str | None = None,
     ) -> TaskUnitResult:
@@ -289,33 +343,33 @@ class TaskUnitRunner:
             role_dir,
         )
 
-        # === PRE[0]: workspace_root not empty ===
+        # === PRE[0]: working_dir not empty ===
         logger.info(
             "[TaskUnitRunner][run][PreCheck] trace_id=%s | "
-            "Checking workspace root is not empty. phase=%s, role_dir=%s",
+            "Checking working_dir is not empty. phase=%s, role_dir=%s",
             resolved_trace_id,
             phase_id,
             role_dir,
         )
-        if not workspace_root:
+        if not working_dir:
             logger.warning(
                 "[TaskUnitRunner][run][ErrorHandled][ERR:PRECONDITION] trace_id=%s | "
-                "Workspace root is empty. phase=%s, role_dir=%s",
+                "Working dir is empty. phase=%s, role_dir=%s",
                 resolved_trace_id,
                 phase_id,
                 role_dir,
             )
             return TaskUnitResult(
                 status=PipelineStatus.BLOCKED,
-                warnings=["workspace_root is empty"],
+                warnings=["working_dir is empty"],
             )
 
-        executor_result = self._run_executor_with_retries(
+        executor_result, executor_attempts_used = self._run_executor_with_retries(
             phase_id=phase_id,
             role_dir=role_dir,
             pipeline=pipeline,
             task_context=task_context,
-            workspace_root=workspace_root,
+            working_dir=working_dir,
             metadata=metadata,
             trace_id=resolved_trace_id,
         )
@@ -334,54 +388,59 @@ class TaskUnitRunner:
                 payload=executor_result.payload,
                 structured_output=_structured_output_from_payload(executor_result.payload),
                 warnings=list(executor_result.payload.get("warnings", [])),
+                executor_attempts_used=executor_attempts_used,
                 raw_text=executor_result.raw_text,
                 conversation_id=executor_result.conversation_id,
             )
 
-        reviewer_result = run_reviewer_step(
-            driver=self._driver,
-            phase_id=phase_id,
-            role_dir=role_dir,
-            step_config=pipeline.reviewer,
-            task_context={**task_context, "executor_payload": executor_result.payload},
-            workspace_root=workspace_root,
-            metadata={**metadata, "trace_id": resolved_trace_id},
-        )
-        reviewer_guardrails = run_guardrails(
-            phase_id=phase_id,
-            step_name=SubRole.REVIEWER,
-            payload=reviewer_result.payload,
-            guardrails=pipeline.reviewer.guardrails,
-            task_context=task_context,
-            trace_id=resolved_trace_id,
-        )
-        reviewer_status = _normalize_status(
-            reviewer_result.status
-            if reviewer_guardrails.status == PipelineStatus.PASS
-            else reviewer_guardrails.status
-        )
-        if reviewer_status != PipelineStatus.PASS:
-            logger.info(
-                "[TaskUnitRunner][run][StepComplete] trace_id=%s | "
-                "Task unit finished with reviewer status. phase=%s, role_dir=%s, status=%s",
-                resolved_trace_id,
-                phase_id,
-                role_dir,
-                reviewer_status,
+        reviewer_result: DriverResult | None = None
+        latest_conversation_id = executor_result.conversation_id
+        if pipeline.reviewer is not None:
+            reviewer_result = run_reviewer_step(
+                driver=self._driver,
+                phase_id=phase_id,
+                role_dir=role_dir,
+                step_config=pipeline.reviewer,
+                task_context={**task_context, "executor_payload": executor_result.payload},
+                working_dir=working_dir,
+                metadata={**metadata, "trace_id": resolved_trace_id},
             )
-            return TaskUnitResult(
-                status=reviewer_status,
-                payload=executor_result.payload,
-                structured_output=_structured_output_from_payload(executor_result.payload),
-                review_feedback=reviewer_result.payload.get("feedback"),
-                warnings=reviewer_guardrails.warnings or list(reviewer_result.payload.get("warnings", [])),
-                raw_text=reviewer_result.raw_text,
-                conversation_id=reviewer_result.conversation_id or executor_result.conversation_id,
+            reviewer_guardrails = run_guardrails(
+                phase_id=phase_id,
+                step_name=SubRole.REVIEWER,
+                payload=reviewer_result.payload,
+                guardrails=pipeline.reviewer.guardrails,
+                task_context=task_context,
+                trace_id=resolved_trace_id,
             )
+            reviewer_status = _normalize_status(
+                reviewer_result.status
+                if reviewer_guardrails.status == PipelineStatus.PASS
+                else reviewer_guardrails.status
+            )
+            if reviewer_status != PipelineStatus.PASS:
+                logger.info(
+                    "[TaskUnitRunner][run][StepComplete] trace_id=%s | "
+                    "Task unit finished with reviewer status. phase=%s, role_dir=%s, status=%s",
+                    resolved_trace_id,
+                    phase_id,
+                    role_dir,
+                    reviewer_status,
+                )
+                return TaskUnitResult(
+                    status=reviewer_status,
+                    payload=executor_result.payload,
+                    structured_output=_structured_output_from_payload(executor_result.payload),
+                    review_feedback=reviewer_result.payload.get("feedback"),
+                    executor_attempts_used=executor_attempts_used,
+                    warnings=reviewer_guardrails.warnings or list(reviewer_result.payload.get("warnings", [])),
+                    raw_text=reviewer_result.raw_text,
+                    conversation_id=reviewer_result.conversation_id or executor_result.conversation_id,
+                )
+            latest_conversation_id = reviewer_result.conversation_id or executor_result.conversation_id
 
         tester_summary = None
         tester_warnings: list[str] = []
-        latest_conversation_id = reviewer_result.conversation_id or executor_result.conversation_id
         if pipeline.tester is not None:
             tester_result = run_tester_step(
                 driver=self._driver,
@@ -389,7 +448,7 @@ class TaskUnitRunner:
                 role_dir=role_dir,
                 step_config=pipeline.tester,
                 task_context={**task_context, "executor_payload": executor_result.payload},
-                workspace_root=workspace_root,
+                working_dir=working_dir,
                 metadata={**metadata, "trace_id": resolved_trace_id},
             )
             tester_guardrails = run_guardrails(
@@ -419,8 +478,9 @@ class TaskUnitRunner:
                     status=tester_status,
                     payload=executor_result.payload,
                     structured_output=_structured_output_from_payload(executor_result.payload),
-                    review_feedback=reviewer_result.payload.get("feedback"),
+                    review_feedback=_safe_review_feedback(reviewer_result),
                     test_summary=tester_result.payload.get("result"),
+                    executor_attempts_used=executor_attempts_used,
                     warnings=tester_guardrails.warnings or list(tester_result.payload.get("warnings", [])),
                     raw_text=tester_result.raw_text,
                     conversation_id=latest_conversation_id,
@@ -439,8 +499,9 @@ class TaskUnitRunner:
             status=PipelineStatus.PASS,
             payload=executor_result.payload,
             structured_output=_structured_output_from_payload(executor_result.payload),
-            review_feedback=reviewer_result.payload.get("feedback"),
+            review_feedback=_safe_review_feedback(reviewer_result),
             test_summary=tester_summary,
+            executor_attempts_used=executor_attempts_used,
             warnings=list(executor_result.payload.get("warnings", [])) + tester_warnings,
             raw_text=executor_result.raw_text,
             conversation_id=latest_conversation_id,

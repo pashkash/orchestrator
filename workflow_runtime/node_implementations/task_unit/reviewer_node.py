@@ -47,7 +47,7 @@ def run_reviewer_step(
     role_dir: str,
     step_config: PipelineStepConfig,
     task_context: dict[str, Any],
-    workspace_root: str,
+    working_dir: str,
     metadata: dict[str, Any],
 ) -> DriverResult:
     trace_id = ensure_trace_id(metadata.get("trace_id"))
@@ -73,7 +73,7 @@ def run_reviewer_step(
             model=step_config.model,
             prompt=prompt,
             task_context=task_context,
-            workspace_root=workspace_root,
+            working_dir=working_dir,
             metadata=metadata,
         )
     )

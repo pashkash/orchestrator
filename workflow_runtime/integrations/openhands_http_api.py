@@ -7,17 +7,18 @@ from dataclasses import dataclass
 from typing import Any
 
 import httpx
+from opentelemetry.propagate import inject as otel_inject
 
 from workflow_runtime.integrations.openhands_runtime import (
     OPENHANDS_EVENT_SEARCH_LIMIT_MAX,
+    OPENHANDS_TERMINAL_EXECUTION_STATUSES,
+    normalize_openhands_execution_status,
 )
 from workflow_runtime.integrations.observability import ensure_trace_id
 from workflow_runtime.integrations.runtime_logging import get_logger
 
 
 logger = get_logger(__name__)
-
-_TERMINAL_STATUSES = {"FINISHED", "COMPLETED", "DONE", "PAUSED", "FAILED", "ERROR", "CANCELLED"}
 
 
 # SEM_BEGIN orchestrator_v1.openhands_http_api.openhands_conversation_handle:v1
@@ -98,10 +99,23 @@ class OpenHandsHttpApi:
     # sft: initialize reusable OpenHands HTTP API client with base url timeout and poll interval
     # idempotent: false
     # logs: -
-    def __init__(self, base_url: str, timeout_seconds: int = 180, poll_interval_seconds: int = 2) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        timeout_seconds: int = 180,
+        poll_interval_seconds: int = 2,
+        max_poll_interval_seconds: int | None = None,
+        poll_log_every_n_attempts: int | None = None,
+    ) -> None:
+        if max_poll_interval_seconds is None:
+            raise ValueError("OpenHandsHttpApi requires max_poll_interval_seconds from runtime config")
+        if poll_log_every_n_attempts is None:
+            raise ValueError("OpenHandsHttpApi requires poll_log_every_n_attempts from runtime config")
         self._base_url = base_url.rstrip("/")
         self._timeout_seconds = timeout_seconds
         self._poll_interval_seconds = poll_interval_seconds
+        self._max_poll_interval_seconds = max_poll_interval_seconds
+        self._poll_log_every_n_attempts = poll_log_every_n_attempts
         self._client = httpx.Client(base_url=self._base_url, timeout=timeout_seconds)
 
     # SEM_END orchestrator_v1.openhands_http_api.openhands_http_api.__init__:v1
@@ -156,7 +170,16 @@ class OpenHandsHttpApi:
     # idempotent: false
     # logs: query: OpenHandsHttpApi _request path
     def _request(self, method: str, path: str, *, json_body: dict[str, Any] | None = None) -> dict[str, Any]:
-        response = self._client.request(method, path, json=json_body)
+        headers: dict[str, str] = {}
+        otel_inject(headers)
+        try:
+            from lmnr import Laminar
+            ctx_str = Laminar.serialize_span_context()
+            if ctx_str:
+                headers["x-lmnr-parent-ctx"] = ctx_str
+        except Exception:
+            pass
+        response = self._client.request(method, path, json=json_body, headers=headers)
         response.raise_for_status()
         return response.json() if response.content else {}
 
@@ -318,7 +341,19 @@ class OpenHandsHttpApi:
             resolved_trace_id,
             conversation_id,
         )
-        response = self._request("POST", f"/api/conversations/{conversation_id}/run")
+        try:
+            response = self._request("POST", f"/api/conversations/{conversation_id}/run")
+        except Exception as exc:
+            if "409" in str(exc):
+                logger.info(
+                    "[OpenHandsHttpApi][run_conversation][DecisionPoint] trace_id=%s | "
+                    "Branch: already_running. Reason: 409 Conflict (conversation already started). "
+                    "conversation_id=%s",
+                    resolved_trace_id,
+                    conversation_id,
+                )
+                return {"already_running": True}
+            raise
         logger.info(
             "[OpenHandsHttpApi][run_conversation][ExternalCall][GROUND] trace_id=%s | "
             "Run triggered. status_code=200, conversation_id=%s",
@@ -357,33 +392,41 @@ class OpenHandsHttpApi:
     # sft: fetch the latest OpenHands conversation state by id
     # idempotent: true
     # logs: query: GET /api/conversations/{id}
-    def get_conversation(self, conversation_id: str, *, trace_id: str | None = None) -> dict[str, Any]:
+    def get_conversation(
+        self,
+        conversation_id: str,
+        *,
+        trace_id: str | None = None,
+        log_reads: bool = True,
+    ) -> dict[str, Any]:
         resolved_trace_id = ensure_trace_id(trace_id)
-        logger.info(
-            "[OpenHandsHttpApi][get_conversation][ContextAnchor] trace_id=%s | "
-            "Fetching conversation state. conversation_id=%s",
-            resolved_trace_id,
-            conversation_id,
-        )
-        logger.info(
-            "[OpenHandsHttpApi][get_conversation][ExternalCall][BELIEF] trace_id=%s | "
-            "Expecting conversation state. conversation_id=%s",
-            resolved_trace_id,
-            conversation_id,
-        )
+        if log_reads:
+            logger.info(
+                "[OpenHandsHttpApi][get_conversation][ContextAnchor] trace_id=%s | "
+                "Fetching conversation state. conversation_id=%s",
+                resolved_trace_id,
+                conversation_id,
+            )
+            logger.info(
+                "[OpenHandsHttpApi][get_conversation][ExternalCall][BELIEF] trace_id=%s | "
+                "Expecting conversation state. conversation_id=%s",
+                resolved_trace_id,
+                conversation_id,
+            )
         response = self._request("GET", f"/api/conversations/{conversation_id}")
-        logger.info(
-            "[OpenHandsHttpApi][get_conversation][ExternalCall][GROUND] trace_id=%s | "
-            "Conversation state received. status_code=200, conversation_id=%s",
-            resolved_trace_id,
-            conversation_id,
-        )
-        logger.info(
-            "[OpenHandsHttpApi][get_conversation][StepComplete] trace_id=%s | "
-            "Fetched conversation state. conversation_id=%s",
-            resolved_trace_id,
-            conversation_id,
-        )
+        if log_reads:
+            logger.info(
+                "[OpenHandsHttpApi][get_conversation][ExternalCall][GROUND] trace_id=%s | "
+                "Conversation state received. status_code=200, conversation_id=%s",
+                resolved_trace_id,
+                conversation_id,
+            )
+            logger.info(
+                "[OpenHandsHttpApi][get_conversation][StepComplete] trace_id=%s | "
+                "Fetched conversation state. conversation_id=%s",
+                resolved_trace_id,
+                conversation_id,
+            )
         return response
 
     # SEM_END orchestrator_v1.openhands_http_api.openhands_http_api.get_conversation:v1
@@ -450,14 +493,15 @@ class OpenHandsHttpApi:
 
     # SEM_BEGIN orchestrator_v1.openhands_http_api.wait_until_finished:v1
     # type: METHOD
-    # use_case: Polls an OpenHands conversation until it reaches a terminal status.
+    # use_case: Polls an OpenHands conversation until it reaches a terminal status without aborting while progress continues.
     # feature:
     #   - Phase 3 driver must wait for the remote run to complete before parsing the result
+    #   - Long-running conversations must stay alive while execution_status or updated_at still change
     #   - openhands/software-agent-sdk REST API
     # pre:
     #   - conversation_id is not empty
     # post:
-    #   - returns the latest conversation state from the OpenHands server
+    #   - returns the latest terminal conversation state from the OpenHands server
     # invariant:
     #   - client reuse is preserved
     # modifies (internal):
@@ -465,59 +509,112 @@ class OpenHandsHttpApi:
     # emits (external):
     #   - external.openhands_server
     # errors:
-    #   - TimeoutError: wait timeout exceeded
+    #   - TimeoutError: idle timeout exceeded without conversation progress
     # depends:
     #   - get_conversation
-    # sft: wait for an OpenHands conversation to reach a terminal execution status
+    # sft: wait for an OpenHands conversation to reach a terminal execution status using idle-timeout semantics
     # idempotent: false
     # logs: query: GET /api/conversations/{id}
     def wait_until_finished(self, conversation_id: str, *, trace_id: str | None = None) -> dict[str, Any]:
         resolved_trace_id = ensure_trace_id(trace_id)
-        deadline = time.monotonic() + self._timeout_seconds
+        current_monotonic = time.monotonic()
+        idle_deadline = current_monotonic + self._timeout_seconds
+        poll_attempt = 0
+        sleep_seconds = max(1, self._poll_interval_seconds)
+        last_execution_status: str | None = None
+        last_updated_at: str | None = None
+        started_wait_at = current_monotonic
+        last_progress_at = current_monotonic
 
         logger.info(
             "[OpenHandsHttpApi][wait_until_finished][ContextAnchor] trace_id=%s | "
-            "Waiting for conversation. conversation_id=%s, timeout_seconds=%d",
+            "Waiting for conversation. conversation_id=%s, idle_timeout_seconds=%d",
             resolved_trace_id,
             conversation_id,
             self._timeout_seconds,
         )
 
-        while time.monotonic() < deadline:
-            state = self.get_conversation(conversation_id, trace_id=resolved_trace_id)
+        while True:
+            poll_attempt += 1
+            state = self.get_conversation(
+                conversation_id,
+                trace_id=resolved_trace_id,
+                log_reads=False,
+            )
             execution_status = str(
                 state.get("execution_status")
                 or state.get("status")
                 or state.get("state", {}).get("execution_status", "")
             ).upper()
-
-            logger.info(
-                "[OpenHandsHttpApi][wait_until_finished][DecisionPoint] trace_id=%s | "
-                "Branch: poll_status. Reason: conversation_id=%s, execution_status=%s",
-                resolved_trace_id,
-                conversation_id,
-                execution_status,
+            updated_at = str(
+                state.get("updated_at")
+                or state.get("state", {}).get("updated_at")
+                or ""
             )
 
-            if execution_status in _TERMINAL_STATUSES:
+            should_log_poll = (
+                poll_attempt == 1
+                or execution_status != last_execution_status
+                or updated_at != last_updated_at
+                or poll_attempt % self._poll_log_every_n_attempts == 0
+            )
+            if should_log_poll:
                 logger.info(
-                    "[OpenHandsHttpApi][wait_until_finished][StepComplete] trace_id=%s | "
-                    "Conversation reached terminal state. conversation_id=%s, execution_status=%s",
+                    "[OpenHandsHttpApi][wait_until_finished][DecisionPoint] trace_id=%s | "
+                    "Branch: poll_status. Reason: conversation_id=%s, execution_status=%s, "
+                    "poll_attempt=%d, next_sleep_seconds=%d",
                     resolved_trace_id,
                     conversation_id,
                     execution_status,
+                    poll_attempt,
+                    sleep_seconds,
+                )
+
+            progress_detected = (
+                poll_attempt == 1
+                or execution_status != last_execution_status
+                or (updated_at and updated_at != last_updated_at)
+            )
+            if progress_detected:
+                last_progress_at = time.monotonic()
+                idle_deadline = last_progress_at + self._timeout_seconds
+
+            last_execution_status = execution_status
+            last_updated_at = updated_at
+
+            normalized_execution_status = normalize_openhands_execution_status(execution_status)
+            if normalized_execution_status in OPENHANDS_TERMINAL_EXECUTION_STATUSES:
+                logger.info(
+                    "[OpenHandsHttpApi][wait_until_finished][StepComplete] trace_id=%s | "
+                    "Conversation reached terminal state. conversation_id=%s, execution_status=%s, "
+                    "poll_attempts=%d",
+                    resolved_trace_id,
+                    conversation_id,
+                    execution_status,
+                    poll_attempt,
                 )
                 return state
 
-            time.sleep(self._poll_interval_seconds)
+            if time.monotonic() >= idle_deadline:
+                idle_for_seconds = int(time.monotonic() - last_progress_at)
+                total_wait_seconds = int(time.monotonic() - started_wait_at)
+                logger.error(
+                    "[OpenHandsHttpApi][wait_until_finished][ErrorHandled][ERR:TIMEOUT] trace_id=%s | "
+                    "Timed out waiting for conversation progress. conversation_id=%s, poll_attempts=%d, "
+                    "execution_status=%s, idle_for_seconds=%d, total_wait_seconds=%d",
+                    resolved_trace_id,
+                    conversation_id,
+                    poll_attempt,
+                    execution_status,
+                    idle_for_seconds,
+                    total_wait_seconds,
+                )
+                raise TimeoutError(
+                    f"Timed out waiting for OpenHands conversation progress '{conversation_id}'"
+                )
 
-        logger.error(
-            "[OpenHandsHttpApi][wait_until_finished][ErrorHandled][ERR:TIMEOUT] trace_id=%s | "
-            "Timed out waiting for conversation. conversation_id=%s",
-            resolved_trace_id,
-            conversation_id,
-        )
-        raise TimeoutError(f"Timed out waiting for OpenHands conversation '{conversation_id}'")
+            time.sleep(sleep_seconds)
+            sleep_seconds = min(sleep_seconds * 2, self._max_poll_interval_seconds)
 
     # SEM_END orchestrator_v1.openhands_http_api.wait_until_finished:v1
 

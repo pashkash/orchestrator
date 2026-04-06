@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -149,6 +150,37 @@ def get_docs_root() -> Path:
 
 
 # SEM_END orchestrator_v1.phase_config_loader.get_docs_root:v1
+
+
+def get_methodology_root_host() -> Path:
+    runtime = get_runtime_config()
+    return Path(runtime.methodology_root_default)
+
+
+def get_methodology_root_runtime() -> Path:
+    runtime = get_runtime_config()
+    env_override = os.getenv("WORKFLOW_METHODOLOGY_ROOT_RUNTIME")
+    if env_override:
+        return Path(env_override)
+    configured = runtime.openhands.get("methodology_root_runtime")
+    if configured:
+        return Path(str(configured))
+    return get_methodology_root_host()
+
+
+def resolve_methodology_entrypoint(*, runtime_visible: bool = True) -> Path:
+    runtime = get_runtime_config()
+    root = get_methodology_root_runtime() if runtime_visible else get_methodology_root_host()
+    candidates = [
+        root / runtime.methodology_agents_entrypoint,
+        root / "docs" / runtime.methodology_agents_entrypoint,
+    ]
+    if runtime_visible and root != get_methodology_root_host():
+        return candidates[0]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
 
 
 # SEM_BEGIN orchestrator_v1.phase_config_loader.resolve_runtime_path:v1

@@ -365,6 +365,7 @@ class TaskUnitResult:
     structured_output: StructuredOutput | None = None
     review_feedback: str | None = None
     test_summary: str | None = None
+    executor_attempts_used: int = 0
     warnings: list[str] = field(default_factory=list)
     human_question: dict[str, Any] | None = None
     raw_text: str = ""
@@ -403,6 +404,13 @@ class PipelineState(TypedDict, total=False):
     user_request: str
     trace_id: str
     workspace_root: str
+    task_worktree_root: str
+    methodology_root_host: str
+    methodology_root_runtime: str
+    methodology_agents_entrypoint: str
+    task_dir_path: str
+    task_card_path: str
+    openhands_conversations_dir: str
 
     current_phase: PhaseId
     current_status: PipelineStatus

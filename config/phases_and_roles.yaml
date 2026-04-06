@@ -1,14 +1,20 @@
 runtime:
   docs_root_alias: "Technical Docs"
   docs_root_default: "/root/squadder-devops/docs"
+  methodology_root_default: "/root/squadder-devops/docs"
+  methodology_agents_entrypoint: "AGENTS.md"
   prompts_root: "Technical Docs/common/roles"
   workspace_root_default: "/root/squadder-devops"
   tasks_root_default: "/root/management-stage/task-history"
   openhands:
     base_url_env: "OPENHANDS_BASE_URL"
+    base_url_default: "http://127.0.0.1:8011"
+    methodology_root_runtime: "/root/squadder-devops/docs"
     llm_api_key_env: "OPENROUTER_API_KEY"
     llm_base_url: "https://openrouter.ai/api/v1"
     poll_interval_seconds: 2
+    max_poll_interval_seconds: 15
+    poll_log_every_n_attempts: 5
     timeout_seconds: 180
     cli_mode: true
     tools:
@@ -26,7 +32,7 @@ phases:
         prompt:
           sub_role: executor
           path: "Technical Docs/common/roles/collector/executor.md"
-        model: "openhands/claude-sonnet-4-5-20250929"
+        model: "openrouter/z-ai/glm-5"
         max_retries: 2
         guardrails:
           - ensure_required_fields
@@ -36,7 +42,7 @@ phases:
         prompt:
           sub_role: reviewer
           path: "Technical Docs/common/roles/collector/reviewer.md"
-        model: "openhands/claude-sonnet-4-5-20250929"
+        model: "openrouter/z-ai/glm-5"
         max_retries: 1
         guardrails:
           - ensure_status_field
@@ -53,7 +59,7 @@ phases:
         prompt:
           sub_role: executor
           path: "Technical Docs/common/roles/supervisor/executor.md"
-        model: "openhands/claude-sonnet-4-5-20250929"
+        model: "openrouter/z-ai/glm-5"
         max_retries: 2
         guardrails:
           - ensure_required_fields
@@ -63,7 +69,7 @@ phases:
         prompt:
           sub_role: reviewer
           path: "Technical Docs/common/roles/supervisor/reviewer.md"
-        model: "openhands/claude-sonnet-4-5-20250929"
+        model: "openrouter/z-ai/glm-5"
         max_retries: 1
         guardrails:
           - ensure_status_field
@@ -82,7 +88,7 @@ phases:
         prompt:
           sub_role: executor
           path: "Technical Docs/common/roles/{role_dir}/executor.md"
-        model: "openhands/claude-sonnet-4-5-20250929"
+        model: "openrouter/z-ai/glm-5"
         max_retries: 3
         guardrails:
           - ensure_structured_output
@@ -92,7 +98,7 @@ phases:
         prompt:
           sub_role: reviewer
           path: "Technical Docs/common/roles/{role_dir}/reviewer.md"
-        model: "openhands/claude-sonnet-4-5-20250929"
+        model: "openrouter/z-ai/glm-5"
         max_retries: 2
         guardrails:
           - ensure_status_field
@@ -102,7 +108,7 @@ phases:
         prompt:
           sub_role: tester
           path: "Technical Docs/common/roles/{role_dir}/tester.md"
-        model: "openhands/gpt-5-mini-2025-08-07"
+        model: "openrouter/z-ai/glm-5"
         max_retries: 1
         guardrails:
           - ensure_status_field
@@ -118,7 +124,7 @@ phases:
         prompt:
           sub_role: executor
           path: "Technical Docs/common/roles/supervisor/executor.md"
-        model: "openhands/claude-sonnet-4-5-20250929"
+        model: "openrouter/z-ai/glm-5"
         max_retries: 1
         guardrails:
           - ensure_required_fields
@@ -128,7 +134,7 @@ phases:
         prompt:
           sub_role: reviewer
           path: "Technical Docs/common/roles/supervisor/reviewer.md"
-        model: "openhands/claude-sonnet-4-5-20250929"
+        model: "openrouter/z-ai/glm-5"
         max_retries: 1
         guardrails:
           - ensure_status_field

@@ -42,7 +42,7 @@ class DriverRequest:
     model: str
     prompt: str
     task_context: dict[str, Any]
-    workspace_root: str
+    working_dir: str
     metadata: dict[str, Any] = field(default_factory=dict)
 
 

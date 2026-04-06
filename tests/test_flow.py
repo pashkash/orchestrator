@@ -7,8 +7,8 @@ from langgraph.types import Command
 
 from workflow_runtime.agent_drivers.base_driver import DriverResult
 from workflow_runtime.agent_drivers.mock_driver import MockDriver
-from workflow_runtime.graph_compiler.langgraph_builder import compile_graph
-from workflow_runtime.graph_compiler.state_schema import PhaseId
+from workflow_runtime.graph_compiler.langgraph_builder import _build_driver, compile_graph
+from workflow_runtime.graph_compiler.state_schema import PhaseId, PipelineStatus
 from workflow_runtime.integrations.phase_config_loader import (
     get_flow_manifest,
     get_runtime_config,
@@ -55,11 +55,27 @@ def test_runtime_loaders_reflect_v1_defaults():
     assert "devops" in roles
     assert "collector" in roles
     assert runtime.phases["execute"].strategy.max_concurrent == 1
+    assert runtime.methodology_root_default == "/root/squadder-devops/docs"
+    assert runtime.methodology_agents_entrypoint == "AGENTS.md"
+    assert runtime.openhands["base_url_default"] == "http://127.0.0.1:8011"
+    assert runtime.openhands["methodology_root_runtime"] == "/root/squadder-devops/docs"
+    assert runtime.openhands["max_poll_interval_seconds"] == 15
+    assert runtime.openhands["poll_log_every_n_attempts"] == 5
     assert flow.version == "1.0"
     assert flow.start_phase == "collect"
 
 
-def test_prompt_builder_reads_shared_and_runtime_contract():
+def test_build_driver_uses_runtime_openhands_base_url_default(monkeypatch):
+    runtime = get_runtime_config()
+    monkeypatch.delenv("OPENHANDS_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    driver = _build_driver("openhands", runtime)
+
+    assert driver._api._base_url == "http://127.0.0.1:8011"
+
+
+def test_prompt_builder_loads_role_prompt_and_runtime_sections():
     runtime = get_runtime_config()
     prompt = compose_prompt(
         phase_id=PhaseId.EXECUTE,
@@ -67,6 +83,10 @@ def test_prompt_builder_reads_shared_and_runtime_contract():
         step_config=runtime.phases["execute"].default_worker_pipeline.executor,
         task_context={},
     )
+    assert "# Role: devops / executor" in prompt
+    assert "executor_common.md" in prompt
+    assert "Methodology Bootstrap" in prompt
+    assert "`/root/squadder-devops/docs/AGENTS.md`" in prompt
     assert "Runtime Task Context" in prompt
     assert "Output Contract" in prompt
 
@@ -104,3 +124,80 @@ def test_human_gate_roundtrip(initial_state):
     assert resumed["current_status"] == "PASS"
     assert resumed["final_result"] == "Approved by human and validated"
     assert resumed["human_decisions"][-1]["response"] == {"approved": True}
+
+
+def test_execute_replan_loop_escalates_to_human_gate_after_executor_budget(task_artifacts):
+    scripted_driver = ScriptedDriver(
+        {
+            ("plan", "executor", "supervisor"): [
+                DriverResult(
+                    status=PipelineStatus.PASS,
+                    payload={
+                        "status": PipelineStatus.PASS,
+                        "plan": [
+                            {
+                                "id": "backend-create-square-file",
+                                "role": "backend",
+                                "description": "Create square.py",
+                                "dependencies": [],
+                                "max_retries": 3,
+                            }
+                        ],
+                        "warnings": [],
+                    },
+                    raw_text="mock-plan-pass",
+                )
+            ],
+            ("execute", "executor", "backend"): [
+                DriverResult(
+                    status=PipelineStatus.NEEDS_FIX_EXECUTOR,
+                    payload={
+                        "status": PipelineStatus.NEEDS_FIX_EXECUTOR,
+                        "warnings": ["Executor returned non-YAML final output"],
+                    },
+                    raw_text="plain text finish",
+                ),
+                DriverResult(
+                    status=PipelineStatus.NEEDS_FIX_EXECUTOR,
+                    payload={
+                        "status": PipelineStatus.NEEDS_FIX_EXECUTOR,
+                        "warnings": ["Executor returned non-YAML final output"],
+                    },
+                    raw_text="plain text finish",
+                ),
+                DriverResult(
+                    status=PipelineStatus.NEEDS_FIX_EXECUTOR,
+                    payload={
+                        "status": PipelineStatus.NEEDS_FIX_EXECUTOR,
+                        "warnings": ["Executor returned non-YAML final output"],
+                    },
+                    raw_text="plain text finish",
+                ),
+            ],
+        }
+    )
+    state = {
+        "task_id": "2026-03-24_1800__multi-agent-system-design",
+        "user_request": "Create square.py",
+        "workspace_root": "/root/squadder-devops",
+        "task_worktree_root": task_artifacts["task_worktree_root"],
+        "trace_id": "test-graph-execute-budget",
+        "task_dir_path": task_artifacts["task_dir_path"],
+        "task_card_path": task_artifacts["task_card_path"],
+        "openhands_conversations_dir": task_artifacts["openhands_conversations_dir"],
+        "current_state": {},
+        "plan": [],
+        "structured_outputs": [],
+        "human_decisions": [],
+        "execution_errors": [],
+        "phase_outputs": {},
+        "phase_attempts": {},
+        "commits": [],
+    }
+
+    app = compile_graph(driver=scripted_driver, checkpointer=MemorySaver())
+    interrupted = app.invoke(state, {"configurable": {"thread_id": "execute-budget-thread"}})
+
+    assert "__interrupt__" in interrupted
+    assert scripted_driver.calls[("plan", "executor", "supervisor")] == 1
+    assert scripted_driver.calls[("execute", "executor", "backend")] == 3

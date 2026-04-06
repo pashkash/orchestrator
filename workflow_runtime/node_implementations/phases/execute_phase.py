@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from lmnr import observe
+
 from workflow_runtime.graph_compiler.state_schema import (
     PhaseId,
     PipelineState,
@@ -13,6 +15,7 @@ from workflow_runtime.graph_compiler.state_schema import (
 from workflow_runtime.graph_compiler.yaml_manifest_parser import PhaseRuntimeConfig
 from workflow_runtime.integrations.observability import ensure_trace_id
 from workflow_runtime.integrations.runtime_logging import get_logger
+from workflow_runtime.integrations.tasks_storage import build_task_artifact_context
 from workflow_runtime.node_implementations.status_aggregation import get_ready_subtasks, has_incomplete_subtasks
 from workflow_runtime.node_implementations.task_unit import TaskUnitRunner
 
@@ -124,6 +127,7 @@ def _append_structured_output(
 # sft: run execute phase sequentially over ready subtasks and mutate the current plan based on task unit results
 # idempotent: false
 # logs: query: ExecutePhase trace_id
+@observe(name="phase_execute")
 def run_execute_phase(
     state: PipelineState,
     *,
@@ -148,7 +152,78 @@ def run_execute_phase(
     while True:
         ready_subtasks = get_ready_subtasks(plan)
         if not ready_subtasks:
+            unresolved_subtasks = [
+                subtask
+                for subtask in plan
+                if subtask.status in {
+                    SubtaskStatus.BLOCKED,
+                    SubtaskStatus.FAILED,
+                    SubtaskStatus.ESCALATED,
+                }
+            ]
+            if unresolved_subtasks:
+                unresolved_ids = ", ".join(subtask.id for subtask in unresolved_subtasks)
+                logger.info(
+                    "[ExecutePhase][run_execute_phase][DecisionPoint] trace_id=%s | "
+                    "Branch: human_gate. Reason: unresolved_subtasks=%s",
+                    trace_id,
+                    unresolved_ids,
+                )
+                logger.info(
+                    "[ExecutePhase][run_execute_phase][StepComplete] trace_id=%s | "
+                    "Execute phase finished. status=%s, outputs=%d",
+                    trace_id,
+                    PipelineStatus.ESCALATE_TO_HUMAN,
+                    len(outputs),
+                )
+                return {
+                    "current_phase": PhaseId.EXECUTE,
+                    "current_status": PipelineStatus.ESCALATE_TO_HUMAN,
+                    "phase_attempts": phase_attempts,
+                    "plan": plan,
+                    "structured_outputs": outputs,
+                    "execution_errors": execution_errors,
+                    "active_subtask_id": unresolved_subtasks[0].id,
+                    "pending_human_input": {
+                        "source_phase": PhaseId.EXECUTE,
+                        "subtask_id": unresolved_subtasks[0].id,
+                        "question": (
+                            "Execute phase stalled with unresolved subtasks: "
+                            f"{unresolved_ids}"
+                        ),
+                    },
+                }
             if has_incomplete_subtasks(plan):
+                if phase_attempts["execute"] >= 3:
+                    logger.info(
+                        "[ExecutePhase][run_execute_phase][DecisionPoint] trace_id=%s | "
+                        "Branch: human_gate. Reason: no_ready_subtasks=True, incomplete_plan=True, attempt=%d",
+                        trace_id,
+                        phase_attempts["execute"],
+                    )
+                    logger.info(
+                        "[ExecutePhase][run_execute_phase][StepComplete] trace_id=%s | "
+                        "Execute phase finished. status=%s, outputs=%d",
+                        trace_id,
+                        PipelineStatus.ESCALATE_TO_HUMAN,
+                        len(outputs),
+                    )
+                    return {
+                        "current_phase": PhaseId.EXECUTE,
+                        "current_status": PipelineStatus.ESCALATE_TO_HUMAN,
+                        "phase_attempts": phase_attempts,
+                        "plan": plan,
+                        "structured_outputs": outputs,
+                        "execution_errors": execution_errors,
+                        "active_subtask_id": None,
+                        "pending_human_input": {
+                            "source_phase": PhaseId.EXECUTE,
+                            "question": (
+                                "Execute phase reached the replan limit with no ready subtasks. "
+                                "Human review is required."
+                            ),
+                        },
+                    }
                 execution_errors.append("No ready subtasks remain; planner must repair the DAG")
                 logger.info(
                     "[ExecutePhase][run_execute_phase][DecisionPoint] trace_id=%s | "
@@ -190,6 +265,13 @@ def run_execute_phase(
 
         subtask = ready_subtasks[0]
         subtask.status = SubtaskStatus.IN_PROGRESS
+        task_artifact_context = build_task_artifact_context(
+            state.get("task_id"),
+            subtask.id,
+            task_dir_path=state.get("task_dir_path"),
+            task_card_path=state.get("task_card_path"),
+            openhands_conversations_dir=state.get("openhands_conversations_dir"),
+        )
         result = task_unit_runner.run(
             phase_id=PhaseId.EXECUTE,
             role_dir=subtask.role,
@@ -198,12 +280,16 @@ def run_execute_phase(
                 "task_id": state.get("task_id"),
                 "user_request": state.get("user_request"),
                 "current_state": state.get("current_state", {}),
+                "source_workspace_root": state.get("workspace_root", ""),
+                "task_worktree_root": state.get("task_worktree_root", ""),
+                "methodology_root_runtime": state.get("methodology_root_runtime", ""),
+                "methodology_agents_entrypoint": state.get("methodology_agents_entrypoint", ""),
                 "subtask_id": subtask.id,
                 "subtask_description": subtask.description,
                 "dependencies": subtask.dependencies,
-                "checklist_ok": True,
+                **task_artifact_context,
             },
-            workspace_root=state["workspace_root"],
+            working_dir=state["task_worktree_root"],
             metadata={
                 "task_id": state.get("task_id"),
                 "phase": PhaseId.EXECUTE,
@@ -213,7 +299,7 @@ def run_execute_phase(
             trace_id=trace_id,
         )
 
-        subtask.retry_count += 1
+        subtask.retry_count += max(1, result.executor_attempts_used)
         if result.status == PipelineStatus.PASS and result.structured_output is not None:
             subtask.status = SubtaskStatus.DONE
             subtask.structured_output = result.structured_output
@@ -264,10 +350,9 @@ def run_execute_phase(
                 },
             }
 
+        exhausted_retries = subtask.retry_count >= subtask.max_retries
         subtask.status = (
-            SubtaskStatus.FAILED
-            if subtask.retry_count >= subtask.max_retries
-            else SubtaskStatus.BLOCKED
+            SubtaskStatus.ESCALATED if exhausted_retries else SubtaskStatus.BLOCKED
         )
         subtask.reviewer_feedback = result.review_feedback
         subtask.tester_result = result.test_summary
@@ -275,10 +360,16 @@ def run_execute_phase(
         execution_errors.append(
             f"Subtask {subtask.id} returned {result.status}: {subtask.escalation_reason}"
         )
+        next_status = (
+            PipelineStatus.ESCALATE_TO_HUMAN
+            if exhausted_retries
+            else PipelineStatus.NEEDS_REPLAN
+        )
         logger.info(
             "[ExecutePhase][run_execute_phase][DecisionPoint] trace_id=%s | "
-            "Branch: needs_replan. Reason: subtask_id=%s, status=%s, retry_count=%d/%d",
+            "Branch: %s. Reason: subtask_id=%s, status=%s, retry_count=%d/%d",
             trace_id,
+            "human_gate" if exhausted_retries else "needs_replan",
             subtask.id,
             result.status,
             subtask.retry_count,
@@ -288,19 +379,26 @@ def run_execute_phase(
             "[ExecutePhase][run_execute_phase][StepComplete] trace_id=%s | "
             "Execute phase finished. status=%s, outputs=%d, active_subtask_id=%s",
             trace_id,
-            PipelineStatus.NEEDS_REPLAN,
+            next_status,
             len(outputs),
             subtask.id,
         )
-        return {
+        updates = {
             "current_phase": PhaseId.EXECUTE,
-            "current_status": PipelineStatus.NEEDS_REPLAN,
+            "current_status": next_status,
             "phase_attempts": phase_attempts,
             "plan": plan,
             "structured_outputs": outputs,
             "execution_errors": execution_errors,
             "active_subtask_id": subtask.id,
         }
+        if exhausted_retries:
+            updates["pending_human_input"] = {
+                "source_phase": PhaseId.EXECUTE,
+                "subtask_id": subtask.id,
+                "question": subtask.escalation_reason,
+            }
+        return updates
 
 
 # SEM_END orchestrator_v1.execute_phase.run_execute_phase:v1
