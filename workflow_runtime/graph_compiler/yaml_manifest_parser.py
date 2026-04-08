@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import yaml
 
-from workflow_runtime.graph_compiler.state_schema import PhaseId, PipelineStatus, SubRole
+from workflow_runtime.graph_compiler.state_schema import (
+    ExecutionBackend,
+    PhaseId,
+    PipelineStatus,
+    SubRole,
+)
 from workflow_runtime.integrations.observability import ensure_trace_id
 from workflow_runtime.integrations.runtime_logging import get_logger
 
@@ -147,11 +153,43 @@ class PromptSpec:
 # SEM_END orchestrator_v1.yaml_manifest_parser.prompt_spec:v1
 
 
+# SEM_BEGIN orchestrator_v1.yaml_manifest_parser.step_execution_config:v1
+# type: CLASS
+# use_case: Typed execution backend selection for one executor/reviewer/tester step.
+# feature:
+#   - Runtime must choose one concrete backend and one optional strategy per step from YAML
+# pre:
+#   -
+# post:
+#   -
+# invariant:
+#   - backend stays within the supported execution backend enum
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   -
+# depends:
+#   - ExecutionBackend
+# sft: define typed execution backend and strategy config for one task unit step
+# idempotent: -
+# logs: -
+@dataclass(frozen=True, slots=True)
+class StepExecutionConfig:
+    backend: ExecutionBackend
+    strategy: str | None
+    runtime_overrides: dict[str, Any] = field(default_factory=dict)
+
+
+# SEM_END orchestrator_v1.yaml_manifest_parser.step_execution_config:v1
+
+
 # SEM_BEGIN orchestrator_v1.yaml_manifest_parser.pipeline_step_config:v1
 # type: CLASS
 # use_case: Typed configuration for one executor/reviewer/tester step.
 # feature:
-#   - TaskUnit runtime needs role prompt model retries and guardrails packaged per step
+#   - TaskUnit runtime needs role prompt model retries guardrails and execution backend packaged per step
 # pre:
 #   -
 # post:
@@ -166,13 +204,15 @@ class PromptSpec:
 #   -
 # depends:
 #   - PromptSpec
-# sft: define typed pipeline step configuration for one task unit role
+#   - StepExecutionConfig
+# sft: define typed pipeline step configuration for one task unit role including execution backend and strategy
 # idempotent: -
 # logs: -
 @dataclass(frozen=True, slots=True)
 class PipelineStepConfig:
     role_dir: str
     prompt: PromptSpec
+    execution: StepExecutionConfig
     model: str
     max_retries: int
     guardrails: list[str]
@@ -280,6 +320,40 @@ class PhaseRuntimeConfig:
 # SEM_END orchestrator_v1.yaml_manifest_parser.phase_runtime_config:v1
 
 
+# SEM_BEGIN orchestrator_v1.yaml_manifest_parser.task_repository_config:v1
+# type: CLASS
+# use_case: Typed configuration for one repository worktree provisioned inside a task workspace.
+# feature:
+#   - Runtime must provision task-local git worktrees from YAML instead of hardcoded single-repo paths
+# pre:
+#   -
+# post:
+#   -
+# invariant:
+#   - id stays stable across runtime state prompt context and filesystem layout
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   -
+# depends:
+#   -
+# sft: define typed task repository config with source path sparse checkout and role defaults
+# idempotent: -
+# logs: -
+@dataclass(frozen=True, slots=True)
+class TaskRepositoryConfig:
+    id: str
+    source_repo_root: str
+    branch_prefix: str
+    default_sparse_paths: list[str]
+    default_for_roles: list[str]
+
+
+# SEM_END orchestrator_v1.yaml_manifest_parser.task_repository_config:v1
+
+
 # SEM_BEGIN orchestrator_v1.yaml_manifest_parser.runtime_config:v1
 # type: CLASS
 # use_case: Typed in-memory representation of phases_and_roles.yaml.
@@ -308,10 +382,15 @@ class RuntimeConfig:
     docs_root_default: str
     methodology_root_default: str
     methodology_agents_entrypoint: str
+    role_metadata_path: str
+    force_injected_common_documents: list[str]
     prompts_root: str
     workspace_root_default: str
     tasks_root_default: str
+    task_repositories: list[TaskRepositoryConfig]
     openhands: dict
+    direct_llm: dict
+    langchain_tools: dict
     phases: dict[str, PhaseRuntimeConfig]
 
 
@@ -375,9 +454,15 @@ def _parse_prompt(raw: dict) -> PromptSpec:
 # idempotent: true
 # logs: -
 def _parse_step(raw: dict) -> PipelineStepConfig:
+    execution_raw = raw.get("execution", {})
     return PipelineStepConfig(
         role_dir=raw["role_dir"],
         prompt=_parse_prompt(raw["prompt"]),
+        execution=StepExecutionConfig(
+            backend=ExecutionBackend(str(execution_raw.get("backend", ExecutionBackend.OPENHANDS))),
+            strategy=str(execution_raw["strategy"]) if execution_raw.get("strategy") is not None else None,
+            runtime_overrides=dict(execution_raw.get("runtime_overrides", {})),
+        ),
         model=raw["model"],
         max_retries=int(raw["max_retries"]),
         guardrails=list(raw.get("guardrails", [])),
@@ -423,6 +508,23 @@ def _parse_pipeline(raw: dict | None) -> PipelineConfig | None:
 
 
 # SEM_END orchestrator_v1.yaml_manifest_parser._parse_pipeline:v1
+
+
+def _parse_task_repositories(raw_items: list[dict] | None) -> list[TaskRepositoryConfig]:
+    if not raw_items:
+        return []
+    repositories: list[TaskRepositoryConfig] = []
+    for raw_item in raw_items:
+        repositories.append(
+            TaskRepositoryConfig(
+                id=str(raw_item["id"]),
+                source_repo_root=str(raw_item["source_repo_root"]),
+                branch_prefix=str(raw_item.get("branch_prefix", "task")),
+                default_sparse_paths=[str(path) for path in raw_item.get("default_sparse_paths", [])],
+                default_for_roles=[str(role) for role in raw_item.get("default_for_roles", [])],
+            )
+        )
+    return repositories
 
 
 # SEM_BEGIN orchestrator_v1.yaml_manifest_parser.load_flow_manifest:v1
@@ -579,10 +681,20 @@ def load_runtime_config(path: Path) -> RuntimeConfig:
             "methodology_agents_entrypoint",
             "AGENTS.md",
         ),
+        role_metadata_path=raw["runtime"].get(
+            "role_metadata_path",
+            "Technical Docs/common/roles/{role_dir}/role.yaml",
+        ),
+        force_injected_common_documents=list(
+            raw["runtime"].get("force_injected_common_documents", [])
+        ),
         prompts_root=raw["runtime"]["prompts_root"],
         workspace_root_default=raw["runtime"]["workspace_root_default"],
         tasks_root_default=raw["runtime"]["tasks_root_default"],
+        task_repositories=_parse_task_repositories(raw["runtime"].get("task_repositories")),
         openhands=dict(raw["runtime"]["openhands"]),
+        direct_llm=dict(raw["runtime"].get("direct_llm", {})),
+        langchain_tools=dict(raw["runtime"].get("langchain_tools", {})),
         phases=phases,
     )
 

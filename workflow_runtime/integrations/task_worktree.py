@@ -5,6 +5,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from workflow_runtime.graph_compiler.yaml_manifest_parser import TaskRepositoryConfig
 from workflow_runtime.integrations.observability import ensure_trace_id
 from workflow_runtime.integrations.runtime_logging import get_logger
 from workflow_runtime.integrations.tasks_storage import resolve_task_directory, resolve_task_worktree_directory
@@ -58,18 +59,52 @@ def _apply_sparse_checkout(
         )
 
 
+# SEM_BEGIN orchestrator_v1.task_worktree.prepare_task_worktree:v1
+# type: METHOD
+# use_case: Готовит task-local git worktree для одного source repository.
+# feature:
+#   - Каждый task получает изолированную git worktree/branch для безопасной работы исполнителей
+#   - Existing worktree может быть reused, если это уже корректный git worktree для task branch
+# pre:
+#   - source_repo_root is a git repository
+# post:
+#   - returns a ready worktree path for the task branch
+# invariant:
+#   - source repository history is not rewritten by this method
+# modifies (internal):
+#   - file.task_history
+# emits (external):
+#   -
+# errors:
+#   - RuntimeError: pre[0] violated
+# depends:
+#   - _run_git_command
+#   - _apply_sparse_checkout
+# sft: create or reuse a task-local git worktree for a source repository
+# idempotent: false
+# logs: query: TaskWorktree prepare_task_worktree
 def prepare_task_worktree(
     *,
     source_repo_root: str,
     task_id: str,
     task_dir_path: str | None = None,
+    worktree_dir_path: str | None = None,
+    branch_prefix: str = "task",
     sparse_paths: tuple[str, ...] | None = None,
 ) -> Path:
     resolved_trace_id = ensure_trace_id()
     repo_root = Path(source_repo_root).resolve()
     task_dir = Path(task_dir_path).resolve() if task_dir_path else resolve_task_directory(task_id)
-    worktree_dir = resolve_task_worktree_directory(task_id) if task_dir_path is None else task_dir / "workspace"
-    branch_name = f"task/{task_id}"
+    worktree_dir = (
+        Path(worktree_dir_path).resolve()
+        if worktree_dir_path
+        else (
+            resolve_task_worktree_directory(task_id)
+            if task_dir_path is None
+            else task_dir / "workspace"
+        )
+    )
+    branch_name = f"{branch_prefix}/{task_id}"
     resolved_sparse_paths = tuple(path for path in (sparse_paths or ()) if path)
 
     logger.info(
@@ -157,8 +192,77 @@ def prepare_task_worktree(
         branch_name,
     )
     return worktree_dir
+# SEM_END orchestrator_v1.task_worktree.prepare_task_worktree:v1
 
 
+# SEM_BEGIN orchestrator_v1.task_worktree.prepare_task_workspace_repositories:v1
+# type: METHOD
+# use_case: Готовит полный multi-repo workspace для task-а по списку configured repositories.
+# feature:
+#   - orchestration runtime должен развернуть все repo roots, доступные planner/executor steps в одном task workspace
+# pre:
+#   - repositories list may be empty but must contain valid TaskRepositoryConfig objects when provided
+# post:
+#   - returns mapping repo_id -> prepared worktree path
+# invariant:
+#   - repository ids are preserved as workspace folder names
+# modifies (internal):
+#   - file.task_history
+# emits (external):
+#   -
+# errors:
+#   - -
+# depends:
+#   - prepare_task_worktree
+# sft: prepare all configured repository worktrees for a task-local multi-repo workspace
+# idempotent: false
+# logs: query: TaskWorktree prepare_task_workspace_repositories
+def prepare_task_workspace_repositories(
+    *,
+    task_id: str,
+    task_dir_path: str,
+    repositories: list[TaskRepositoryConfig],
+) -> dict[str, Path]:
+    task_dir = Path(task_dir_path).resolve()
+    workspace_root = task_dir / "workspace"
+    workspace_root.mkdir(parents=True, exist_ok=True)
+    repo_worktrees: dict[str, Path] = {}
+    for repository in repositories:
+        worktree_dir = workspace_root / repository.id
+        repo_worktrees[repository.id] = prepare_task_worktree(
+            source_repo_root=repository.source_repo_root,
+            task_id=task_id,
+            task_dir_path=str(task_dir),
+            worktree_dir_path=str(worktree_dir),
+            branch_prefix=repository.branch_prefix,
+            sparse_paths=tuple(repository.default_sparse_paths),
+        )
+    return repo_worktrees
+# SEM_END orchestrator_v1.task_worktree.prepare_task_workspace_repositories:v1
+
+
+# SEM_BEGIN orchestrator_v1.task_worktree.prepare_task_methodology_docs:v1
+# type: METHOD
+# use_case: Делает task-local runtime-visible link на methodology/docs root.
+# feature:
+#   - Tool-capable agents должны видеть methodology packet внутри task directory без копирования всего docs дерева
+# pre:
+#   - methodology_source_root exists and is a directory
+# post:
+#   - returns task-local docs symlink path
+# invariant:
+#   - source docs tree is never modified
+# modifies (internal):
+#   - file.task_history
+# emits (external):
+#   -
+# errors:
+#   - RuntimeError: pre[0] violated
+# depends:
+#   - ensure_trace_id
+# sft: create or reuse a task-local symlink to the methodology docs root
+# idempotent: false
+# logs: query: TaskWorktree prepare_task_methodology_docs
 def prepare_task_methodology_docs(
     *,
     task_dir_path: str,
@@ -205,3 +309,4 @@ def prepare_task_methodology_docs(
         docs_target,
     )
     return docs_target
+# SEM_END orchestrator_v1.task_worktree.prepare_task_methodology_docs:v1

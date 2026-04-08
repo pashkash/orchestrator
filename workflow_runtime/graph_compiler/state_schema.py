@@ -160,14 +160,14 @@ class StructuredOutputStatus(StrEnum):
 # type: CLASS
 # use_case: Enumerates supported runtime-driver backends for graph compilation.
 # feature:
-#   - The same graph can switch between mock and OpenHands backends without changing phase wrappers
-#   - Task card 2026-03-24_1800__multi-agent-system-design, D5
+#   - The same graph can switch between mock and live routed runtime without changing phase wrappers
+#   - Task card 2026-04-07_1800__orchestrator-latency-and-observability, D13-D15
 # pre:
 #   -
 # post:
 #   -
 # invariant:
-#   - values match runtime configuration and env var parsing
+#   - canonical enum values match current runtime semantics, while deprecated aliases are normalized separately
 # modifies (internal):
 #   -
 # emits (external):
@@ -176,15 +176,78 @@ class StructuredOutputStatus(StrEnum):
 #   -
 # depends:
 #   -
-# sft: define runtime driver mode enum for mock and OpenHands execution backends
+# sft: define runtime driver mode enum for mock and live hybrid execution backends
 # idempotent: -
 # logs: -
 class DriverMode(StrEnum):
     MOCK = "mock"
-    OPENHANDS = "openhands"
+    LIVE = "live"
+
+    # SEM_BEGIN orchestrator_v1.state.driver_mode.from_raw:v1
+    # type: METHOD
+    # use_case: Нормализует raw driver mode из env/CLI/tests в canonical DriverMode с поддержкой deprecated alias.
+    # feature:
+    #   - Migration от misleading `openhands` name к честному `live` не должна ломать существующие env/tests
+    #   - Task card 2026-04-07_1800__orchestrator-latency-and-observability, D13
+    # pre:
+    #   - value is DriverMode or string-like identifier
+    # post:
+    #   - returns canonical DriverMode value
+    # invariant:
+    #   - alias `openhands` always resolves to DriverMode.LIVE
+    # modifies (internal):
+    #   -
+    # emits (external):
+    #   -
+    # errors:
+    #   - ValueError: raw mode is unsupported
+    # depends:
+    #   -
+    # sft: normalize raw runtime driver mode values and deprecated aliases into the canonical enum
+    # idempotent: true
+    # logs: -
+    @classmethod
+    def from_raw(cls, value: "DriverMode | str") -> "DriverMode":
+        raw_value = value if isinstance(value, cls) else str(value).strip().lower()
+        if raw_value == "openhands":
+            return cls.LIVE
+        return cls(raw_value)
+    # SEM_END orchestrator_v1.state.driver_mode.from_raw:v1
 
 
 # SEM_END orchestrator_v1.state.driver_mode:v1
+
+
+# SEM_BEGIN orchestrator_v1.state.execution_backend:v1
+# type: CLASS
+# use_case: Enumerates concrete execution backends available to one task-unit step.
+# feature:
+#   - Runtime must be able to switch any phase step between OpenHands direct LLM and tool-calling execution from YAML
+#   - Task card 2026-04-05_1900__oh-laminar-otel-gui, T43
+# pre:
+#   -
+# post:
+#   -
+# invariant:
+#   - enum values match the runtime YAML backend names
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   -
+# depends:
+#   -
+# sft: define execution backend enum for per-step runtime backend selection in the orchestrator
+# idempotent: -
+# logs: -
+class ExecutionBackend(StrEnum):
+    OPENHANDS = "openhands"
+    DIRECT_LLM = "direct_llm"
+    LANGCHAIN_TOOLS = "langchain_tools"
+
+
+# SEM_END orchestrator_v1.state.execution_backend:v1
 
 
 # SEM_BEGIN orchestrator_v1.state.sub_role:v1
@@ -335,6 +398,81 @@ class SubtaskState:
 # SEM_END orchestrator_v1.state.subtask_state:v1
 
 
+# SEM_BEGIN orchestrator_v1.state.runtime_artifact_ref:v1
+# type: CLASS
+# use_case: Stores a compact pointer to one durable runtime artifact persisted on disk.
+# feature:
+#   - PipelineState must index prompt/payload/guardrail/human-gate artifacts without embedding large blobs
+#   - Task card 2026-04-08_2107__design-approval-aware-runtime-storage, D3-D5
+# pre:
+#   -
+# post:
+#   -
+# invariant:
+#   - path points to a file inside task-local runtime artifacts storage
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   -
+# depends:
+#   -
+# sft: define a compact typed pointer to one persisted runtime artifact file
+# idempotent: -
+# logs: -
+class RuntimeArtifactRef(TypedDict, total=False):
+    artifact_kind: str
+    path: str
+    phase_id: str
+    subtask_id: str
+    sub_role: str
+    attempt: int
+    created_at: str
+    trace_id: str
+    sha256: str
+
+
+# SEM_END orchestrator_v1.state.runtime_artifact_ref:v1
+
+
+# SEM_BEGIN orchestrator_v1.state.runtime_step_ref:v1
+# type: CLASS
+# use_case: Stores a compact summary pointer for one phase/subtask/sub-role attempt.
+# feature:
+#   - LangGraph state must expose an append-only journal of runtime steps and the latest summary per key
+#   - Task card 2026-04-08_2107__design-approval-aware-runtime-storage, D4-D5
+# pre:
+#   -
+# post:
+#   -
+# invariant:
+#   - summary_path points to the canonical summary file for this attempt
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   -
+# depends:
+#   - RuntimeArtifactRef
+# sft: define a compact summary record for one persisted runtime step attempt
+# idempotent: -
+# logs: -
+class RuntimeStepRef(TypedDict, total=False):
+    step_key: str
+    phase_id: str
+    subtask_id: str
+    sub_role: str
+    attempt: int
+    status: str
+    summary_path: str
+    artifact_refs: list[RuntimeArtifactRef]
+
+
+# SEM_END orchestrator_v1.state.runtime_step_ref:v1
+
+
 # SEM_BEGIN orchestrator_v1.state.task_unit_result:v1
 # type: CLASS
 # use_case: Normalized result of a universal TaskUnit execution regardless of phase.
@@ -370,6 +508,9 @@ class TaskUnitResult:
     human_question: dict[str, Any] | None = None
     raw_text: str = ""
     conversation_id: str | None = None
+    runtime_step_refs: list[RuntimeStepRef] = field(default_factory=list)
+    latest_step_ref_by_key: dict[str, RuntimeStepRef] = field(default_factory=dict)
+    pending_approval_ref: RuntimeArtifactRef | None = None
 
 
 # SEM_END orchestrator_v1.state.task_unit_result:v1
@@ -405,6 +546,10 @@ class PipelineState(TypedDict, total=False):
     trace_id: str
     workspace_root: str
     task_worktree_root: str
+    primary_workspace_repo_id: str
+    source_workspace_roots: dict[str, str]
+    role_workspace_repo_map: dict[str, str]
+    task_workspace_repos: dict[str, str]
     methodology_root_host: str
     methodology_root_runtime: str
     methodology_agents_entrypoint: str
@@ -426,6 +571,11 @@ class PipelineState(TypedDict, total=False):
     execution_errors: list[str]
     human_decisions: list[dict[str, Any]]
     pending_human_input: dict[str, Any] | None
+    runtime_step_refs: list[RuntimeStepRef]
+    latest_step_ref_by_key: dict[str, RuntimeStepRef]
+    pending_approval_ref: RuntimeArtifactRef | None
+    human_decision_refs: list[RuntimeArtifactRef]
+    cleanup_manifest_ref: RuntimeArtifactRef | None
 
     final_result: str | None
     commits: list[str]

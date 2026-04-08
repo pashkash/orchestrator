@@ -12,6 +12,7 @@ from workflow_runtime.integrations.runtime_logging import get_logger
 
 
 logger = get_logger(__name__)
+_CHECKLIST_RESOLUTION_STATUSES = {"done", "not_applicable", "failed", "blocked"}
 
 
 # SEM_BEGIN orchestrator_v1.guardrail_checker.guardrail_result:v1
@@ -190,7 +191,9 @@ def _check_task_artifact_checklist(task_context: dict[str, Any]) -> list[str]:
         artifact_paths = [("task_card", Path(task_card_path))]
 
     if not artifact_paths:
-        return ["Checklist guardrail requires an existing task_card_path or subtask_card_path"]
+        if subtask_card_path or task_card_path:
+            return ["Checklist guardrail requires an existing task_card_path or subtask_card_path"]
+        return []
 
     for label, path in artifact_paths:
         unchecked = _extract_unchecked_boxes(path)
@@ -204,6 +207,67 @@ def _check_task_artifact_checklist(task_context: dict[str, Any]) -> list[str]:
 
 
 # SEM_END orchestrator_v1.guardrail_checker._check_task_artifact_checklist:v1
+
+
+def _check_prompt_checklist_coverage(
+    *,
+    payload: dict[str, Any],
+    task_context: dict[str, Any],
+) -> list[str]:
+    expected_items = task_context.get("guardrail_prompt_checklists")
+    if not isinstance(expected_items, list) or not expected_items:
+        return []
+
+    raw_resolutions = payload.get("checklist_resolutions")
+    if not isinstance(raw_resolutions, list):
+        return [
+            "checklist_resolutions must be a list covering all checklist items from role/common/standards sources"
+        ]
+
+    warnings: list[str] = []
+    resolution_by_id: dict[str, dict[str, Any]] = {}
+    for entry in raw_resolutions:
+        if not isinstance(entry, dict):
+            warnings.append("Each checklist_resolutions entry must be a mapping")
+            continue
+        item_id = str(entry.get("id") or "").strip()
+        if not item_id:
+            warnings.append("Each checklist_resolutions entry must include a non-empty id")
+            continue
+        if item_id in resolution_by_id:
+            warnings.append(f"Duplicate checklist_resolutions id: {item_id}")
+            continue
+        resolution_by_id[item_id] = entry
+
+    missing_ids = [str(item.get("id") or "").strip() for item in expected_items if str(item.get("id") or "").strip() not in resolution_by_id]
+    if missing_ids:
+        preview = ", ".join(missing_ids[:5])
+        suffix = " ..." if len(missing_ids) > 5 else ""
+        warnings.append(f"Missing checklist_resolutions for checklist item ids: {preview}{suffix}")
+
+    payload_status = str(payload.get("status") or "").strip().upper()
+    for item in expected_items:
+        item_id = str(item.get("id") or "").strip()
+        if not item_id or item_id not in resolution_by_id:
+            continue
+        resolution = resolution_by_id[item_id]
+        raw_status = str(resolution.get("status") or "").strip().lower()
+        if raw_status not in _CHECKLIST_RESOLUTION_STATUSES:
+            warnings.append(
+                f"Checklist item {item_id} has invalid resolution status: {resolution.get('status')}"
+            )
+        evidence = str(
+            resolution.get("evidence")
+            or resolution.get("reason")
+            or ""
+        ).strip()
+        if not evidence:
+            warnings.append(f"Checklist item {item_id} must include non-empty evidence")
+        if payload_status == PipelineStatus.PASS and raw_status in {"failed", "blocked"}:
+            warnings.append(
+                f"Checklist item {item_id} is marked {raw_status} while payload status is PASS"
+            )
+    return warnings
 
 
 # SEM_BEGIN orchestrator_v1.guardrail_checker.run_guardrails:v1
@@ -288,6 +352,12 @@ def run_guardrails(
                         warnings.append(f"structured_output missing key: {key}")
         elif guardrail_name == "ensure_checklist":
             warnings.extend(_check_task_artifact_checklist(task_context))
+            warnings.extend(
+                _check_prompt_checklist_coverage(
+                    payload=payload,
+                    task_context=task_context,
+                )
+            )
         elif guardrail_name == "ensure_tests_summary" and not payload.get("tests_passed") and not payload.get("result"):
             warnings.append("Tester payload must include tests summary")
 

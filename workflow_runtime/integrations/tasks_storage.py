@@ -3,21 +3,37 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
-from dataclasses import asdict
+from dataclasses import asdict, is_dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import yaml
 
-from workflow_runtime.graph_compiler.state_schema import StructuredOutput, SubtaskState, SubtaskStatus
+from workflow_runtime.graph_compiler.state_schema import (
+    RuntimeArtifactRef,
+    RuntimeStepRef,
+    StructuredOutput,
+    SubtaskState,
+    SubtaskStatus,
+)
 from workflow_runtime.integrations.observability import ensure_trace_id
 from workflow_runtime.integrations.phase_config_loader import get_runtime_config
 from workflow_runtime.integrations.runtime_logging import get_logger
 
 
 logger = get_logger(__name__)
+
+
+def _resolve_effective_task_directory(*, task_id: str | None, task_dir_path: str | None = None) -> Path:
+    if task_dir_path:
+        return Path(task_dir_path)
+    if task_id:
+        return resolve_task_directory(task_id)
+    raise ValueError("task_id or task_dir_path is required")
 
 
 # SEM_BEGIN orchestrator_v1.tasks_storage.get_tasks_root:v1
@@ -165,11 +181,42 @@ def resolve_openhands_conversations_directory(task_id: str) -> Path:
     return resolve_task_directory(task_id) / "runtime_artifacts" / "openhands_conversations"
 
 
+# SEM_END orchestrator_v1.tasks_storage.resolve_openhands_conversations_directory:v1
+
+
+def resolve_step_payloads_directory(task_id: str) -> Path:
+    return resolve_task_directory(task_id) / "runtime_artifacts" / "step_payloads"
+
+
+def resolve_cleanup_directory(task_id: str) -> Path:
+    return resolve_task_directory(task_id) / "runtime_artifacts" / "cleanup"
+
+
+# SEM_BEGIN orchestrator_v1.tasks_storage.resolve_task_worktree_directory:v1
+# type: METHOD
+# use_case: Возвращает workspace root directory для task-local multi-repo worktrees.
+# feature:
+#   - run_pipeline/task_worktree helpers используют единый путь task_dir/workspace как общий контейнер worktree-ов
+# pre:
+#   - task_id is not empty
+# post:
+#   - returns the workspace directory path for that task
+# invariant:
+#   - worktree root stays colocated with the parent task folder
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   - -
+# depends:
+#   - resolve_task_directory
+# sft: resolve the workspace root directory for task-local repository worktrees
+# idempotent: true
+# logs: -
 def resolve_task_worktree_directory(task_id: str) -> Path:
     return resolve_task_directory(task_id) / "workspace"
-
-
-# SEM_END orchestrator_v1.tasks_storage.resolve_openhands_conversations_directory:v1
+# SEM_END orchestrator_v1.tasks_storage.resolve_task_worktree_directory:v1
 
 
 def _task_title(raw_text: str) -> str:
@@ -177,12 +224,50 @@ def _task_title(raw_text: str) -> str:
     return title[:80] if title else "Runtime task"
 
 
+def _render_repos_lines(
+    *,
+    workspace_root: str,
+    workspace_roots: dict[str, str] | None = None,
+) -> list[str]:
+    rendered_roots = [
+        str(path).strip()
+        for path in (workspace_roots or {}).values()
+        if str(path).strip()
+    ]
+    if not rendered_roots and workspace_root.strip():
+        rendered_roots = [workspace_root.strip()]
+    return [f"  - {path}" for path in rendered_roots]
+
+
+# SEM_BEGIN orchestrator_v1.tasks_storage.bootstrap_task_card:v1
+# type: METHOD
+# use_case: Создаёт parent TASK.md по шаблону task framework, если он ещё не существует.
+# feature:
+#   - Каждый orchestrator run должен иметь task card как рабочую память и точку синхронизации для planner/execute
+# pre:
+#   - task_id is not empty
+# post:
+#   - returns a task card path that exists on disk
+# invariant:
+#   - existing TASK.md is reused unchanged
+# modifies (internal):
+#   - file.task_history
+# emits (external):
+#   -
+# errors:
+#   - -
+# depends:
+#   - resolve_task_directory
+# sft: create the parent task card from the standard template if it does not already exist
+# idempotent: false
+# logs: -
 def bootstrap_task_card(
     *,
     task_id: str,
     user_request: str,
     workspace_root: str,
     task_worktree_root: str,
+    workspace_roots: dict[str, str] | None = None,
     task_dir_path: str | None = None,
     task_card_path: str | None = None,
 ) -> Path:
@@ -204,7 +289,7 @@ def bootstrap_task_card(
                 "- Role: none",
                 "- Areas: devops",
                 "- Repos:",
-                f"  - {workspace_root}",
+                *_render_repos_lines(workspace_root=workspace_root, workspace_roots=workspace_roots),
                 f"- Created at: {timestamp}",
                 f"- Updated at: {timestamp}",
                 "- Template ver 0.3",
@@ -282,6 +367,7 @@ def bootstrap_task_card(
         + "\n"
     )
     return task_card
+# SEM_END orchestrator_v1.tasks_storage.bootstrap_task_card:v1
 
 
 def _render_task_execution_plan(plan: list[SubtaskState]) -> str:
@@ -294,10 +380,34 @@ def _render_task_execution_plan(plan: list[SubtaskState]) -> str:
     return "\n".join(lines)
 
 
+# SEM_BEGIN orchestrator_v1.tasks_storage.subtask_card_content:v1
+# type: METHOD
+# use_case: Рендерит markdown content для нового subtask card из planner output.
+# feature:
+#   - Каждый planned subtask должен получить self-contained card с тем же task framework contract, что и parent TASK.md
+# pre:
+#   - subtask contains id, role and description
+# post:
+#   - returns markdown content for one subtask card
+# invariant:
+#   - generated subtask card follows the shared task framework layout
+# modifies (internal):
+#   -
+# emits (external):
+#   -
+# errors:
+#   - -
+# depends:
+#   - _task_title
+#   - _render_repos_lines
+# sft: render the markdown body for one subtask card using the planner output and workspace metadata
+# idempotent: true
+# logs: -
 def _subtask_card_content(
     *,
     task_id: str,
     workspace_root: str,
+    workspace_roots: dict[str, str] | None,
     subtask: SubtaskState,
 ) -> str:
     timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%SZ")
@@ -312,7 +422,7 @@ def _subtask_card_content(
                 f"- Role: {subtask.role}",
                 "- Areas: devops",
                 "- Repos:",
-                f"  - {workspace_root}",
+                *_render_repos_lines(workspace_root=workspace_root, workspace_roots=workspace_roots),
                 f"- Created at: {timestamp}",
                 f"- Updated at: {timestamp}",
                 "- Template ver 0.3",
@@ -387,8 +497,32 @@ def _subtask_card_content(
         )
         + "\n"
     )
+# SEM_END orchestrator_v1.tasks_storage.subtask_card_content:v1
 
 
+# SEM_BEGIN orchestrator_v1.tasks_storage.sync_plan_to_task_artifacts:v1
+# type: METHOD
+# use_case: Синхронизирует planner output в parent TASK.md и создаёт subtask cards.
+# feature:
+#   - Planner plan должен материализоваться в task-history markdown artifacts до execute phase
+# pre:
+#   - task_context contains task_id
+# post:
+#   - parent TASK.md execution plan updated
+#   - missing subtask markdown files created for every planned subtask
+# invariant:
+#   - existing subtask cards are not overwritten
+# modifies (internal):
+#   - file.task_history
+# emits (external):
+#   -
+# errors:
+#   - -
+# depends:
+#   - bootstrap_task_card
+# sft: update the parent task card execution plan and create missing subtask cards from planner output
+# idempotent: false
+# logs: -
 def sync_plan_to_task_artifacts(
     *,
     task_context: dict[str, Any],
@@ -404,6 +538,7 @@ def sync_plan_to_task_artifacts(
         user_request=str(task_context.get("user_request") or task_id),
         workspace_root=str(task_context.get("source_workspace_root") or ""),
         task_worktree_root=str(task_context.get("task_worktree_root") or resolve_task_worktree_directory(task_id)),
+        workspace_roots=dict(task_context.get("source_workspace_roots") or {}),
         task_dir_path=str(task_dir),
         task_card_path=str(task_context.get("task_card_path") or ""),
     )
@@ -426,6 +561,7 @@ def sync_plan_to_task_artifacts(
     task_card.write_text(task_text)
 
     workspace_root = str(task_context.get("source_workspace_root") or "")
+    workspace_roots = dict(task_context.get("source_workspace_roots") or {})
     for subtask in plan:
         subtask_card = task_dir / f"{subtask.id}.md"
         if subtask_card.exists():
@@ -434,9 +570,11 @@ def sync_plan_to_task_artifacts(
             _subtask_card_content(
                 task_id=task_id,
                 workspace_root=workspace_root,
+                workspace_roots=workspace_roots,
                 subtask=subtask,
             )
         )
+# SEM_END orchestrator_v1.tasks_storage.sync_plan_to_task_artifacts:v1
 
 
 # SEM_BEGIN orchestrator_v1.tasks_storage.build_task_artifact_context:v1
@@ -449,6 +587,8 @@ def sync_plan_to_task_artifacts(
 #   -
 # post:
 #   - returns a dict with resolved task artifact paths or an empty dict when task_id is absent
+#   - phase-level contexts expose TASK.md only when the parent card already exists
+#   - subtask-level contexts always expose the parent TASK.md path together with the subtask card path
 # invariant:
 #   - no filesystem mutation occurs
 # modifies (internal):
@@ -486,15 +626,512 @@ def build_task_artifact_context(
     context = {
         "task_dir_path": str(task_dir),
         "task_worktree_root": str(task_dir / "workspace"),
-        "task_card_path": str(resolved_task_card),
         "openhands_conversations_dir": str(resolved_conversations_dir),
     }
+    include_parent_task_card = bool(subtask_id) or resolved_task_card.exists()
+    if include_parent_task_card:
+        context["task_card_path"] = str(resolved_task_card)
+    if resolved_task_card.exists():
+        context["task_card_content"] = resolved_task_card.read_text()
     if subtask_id:
-        context["subtask_card_path"] = str(task_dir / f"{subtask_id}.md")
+        subtask_card = task_dir / f"{subtask_id}.md"
+        context["subtask_card_path"] = str(subtask_card)
+        if subtask_card.exists():
+            context["subtask_card_content"] = subtask_card.read_text()
     return context
 
 
 # SEM_END orchestrator_v1.tasks_storage.build_task_artifact_context:v1
+
+
+def _normalize_runtime_json(value: Any) -> Any:
+    if is_dataclass(value):
+        return _normalize_runtime_json(asdict(value))
+    if hasattr(value, "value"):
+        return getattr(value, "value")
+    if isinstance(value, dict):
+        return {str(key): _normalize_runtime_json(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_normalize_runtime_json(item) for item in value]
+    if isinstance(value, tuple):
+        return [_normalize_runtime_json(item) for item in value]
+    return value
+
+
+def _write_json_file(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(_normalize_runtime_json(payload), indent=2, ensure_ascii=True))
+
+
+def _sha256_for_path(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _normalize_runtime_subtask_id(subtask_id: str | None) -> str:
+    normalized = str(subtask_id or "").strip()
+    return normalized or "phase-level"
+
+
+def build_runtime_step_key(phase_id: str, subtask_id: str | None, sub_role: str) -> str:
+    return f"{phase_id}/{_normalize_runtime_subtask_id(subtask_id)}/{sub_role}"
+
+
+def resolve_step_attempt_directory(
+    *,
+    task_id: str,
+    phase_id: str,
+    subtask_id: str | None,
+    sub_role: str,
+    attempt: int,
+    task_dir_path: str | None = None,
+) -> Path:
+    return (
+        _resolve_effective_task_directory(task_id=task_id, task_dir_path=task_dir_path)
+        / "runtime_artifacts"
+        / "step_payloads"
+        / phase_id
+        / _normalize_runtime_subtask_id(subtask_id)
+        / sub_role
+        / f"attempt-{attempt:03d}"
+    )
+
+
+def _build_runtime_artifact_ref(
+    *,
+    artifact_kind: str,
+    path: Path,
+    phase_id: str,
+    subtask_id: str | None,
+    sub_role: str,
+    attempt: int,
+    created_at: str,
+    trace_id: str,
+) -> RuntimeArtifactRef:
+    return {
+        "artifact_kind": artifact_kind,
+        "path": str(path),
+        "phase_id": phase_id,
+        "subtask_id": _normalize_runtime_subtask_id(subtask_id),
+        "sub_role": sub_role,
+        "attempt": attempt,
+        "created_at": created_at,
+        "trace_id": trace_id,
+        "sha256": _sha256_for_path(path),
+    }
+
+
+def _load_runtime_artifact_refs(path: Path) -> list[RuntimeArtifactRef]:
+    if not path.exists():
+        return []
+    loaded = json.loads(path.read_text())
+    return list(loaded) if isinstance(loaded, list) else []
+
+
+def _persist_step_summary(
+    *,
+    summary_path: Path,
+    refs_path: Path,
+    payload: dict[str, Any],
+) -> None:
+    refs = _load_runtime_artifact_refs(refs_path)
+    summary_payload = {
+        **payload,
+        "artifact_refs_path": str(refs_path),
+        "artifact_refs": refs,
+    }
+    _write_json_file(summary_path, summary_payload)
+
+
+def persist_driver_step_artifacts(
+    *,
+    task_context: dict[str, Any],
+    phase_id: str,
+    role_dir: str,
+    sub_role: str,
+    attempt: int,
+    trace_id: str | None,
+    status: str,
+    request_artifact: dict[str, Any],
+    raw_text: str,
+    parsed_payload: dict[str, Any],
+    artifact_refs: dict[str, Any] | None = None,
+) -> RuntimeStepRef | None:
+    resolved_trace_id = ensure_trace_id(trace_id)
+    task_id = str(task_context.get("task_id") or "").strip()
+    task_dir_path = str(task_context.get("task_dir_path") or "").strip()
+    if not task_id and not task_dir_path:
+        return None
+    effective_task_id = task_id or Path(task_dir_path).name
+    subtask_id = task_context.get("subtask_id")
+    attempt_dir = resolve_step_attempt_directory(
+        task_id=effective_task_id,
+        phase_id=phase_id,
+        subtask_id=subtask_id,
+        sub_role=sub_role,
+        attempt=attempt,
+        task_dir_path=task_dir_path or None,
+    )
+    attempt_dir.mkdir(parents=True, exist_ok=True)
+    created_at = datetime.now(UTC).isoformat()
+
+    driver_request_path = attempt_dir / "driver_request.json"
+    prompt_path = attempt_dir / "prompt.txt"
+    raw_text_path = attempt_dir / "raw_text.md"
+    parsed_payload_path = attempt_dir / "parsed_payload.json"
+    refs_path = attempt_dir / "artifact_refs.json"
+    summary_path = attempt_dir / "step_summary.json"
+
+    _write_json_file(driver_request_path, request_artifact)
+    prompt_path.write_text(str(request_artifact.get("full_prompt") or ""))
+    raw_text_path.write_text(raw_text)
+    _write_json_file(parsed_payload_path, parsed_payload)
+
+    persisted_refs: list[RuntimeArtifactRef] = [
+        _build_runtime_artifact_ref(
+            artifact_kind="driver_request",
+            path=driver_request_path,
+            phase_id=phase_id,
+            subtask_id=subtask_id,
+            sub_role=sub_role,
+            attempt=attempt,
+            created_at=created_at,
+            trace_id=resolved_trace_id,
+        ),
+        _build_runtime_artifact_ref(
+            artifact_kind="prompt",
+            path=prompt_path,
+            phase_id=phase_id,
+            subtask_id=subtask_id,
+            sub_role=sub_role,
+            attempt=attempt,
+            created_at=created_at,
+            trace_id=resolved_trace_id,
+        ),
+        _build_runtime_artifact_ref(
+            artifact_kind="raw_text",
+            path=raw_text_path,
+            phase_id=phase_id,
+            subtask_id=subtask_id,
+            sub_role=sub_role,
+            attempt=attempt,
+            created_at=created_at,
+            trace_id=resolved_trace_id,
+        ),
+        _build_runtime_artifact_ref(
+            artifact_kind="parsed_payload",
+            path=parsed_payload_path,
+            phase_id=phase_id,
+            subtask_id=subtask_id,
+            sub_role=sub_role,
+            attempt=attempt,
+            created_at=created_at,
+            trace_id=resolved_trace_id,
+        ),
+    ]
+    for artifact_kind, raw_path in dict(artifact_refs or {}).items():
+        candidate_path = Path(str(raw_path))
+        if not candidate_path.exists():
+            continue
+        persisted_refs.append(
+            _build_runtime_artifact_ref(
+                artifact_kind=str(artifact_kind),
+                path=candidate_path,
+                phase_id=phase_id,
+                subtask_id=subtask_id,
+                sub_role=sub_role,
+                attempt=attempt,
+                created_at=created_at,
+                trace_id=resolved_trace_id,
+            )
+        )
+    _write_json_file(refs_path, persisted_refs)
+
+    step_ref: RuntimeStepRef = {
+        "step_key": build_runtime_step_key(phase_id, subtask_id, sub_role),
+        "phase_id": phase_id,
+        "subtask_id": _normalize_runtime_subtask_id(subtask_id),
+        "sub_role": sub_role,
+        "attempt": attempt,
+        "status": str(status),
+        "summary_path": str(summary_path),
+        "artifact_refs": persisted_refs,
+    }
+    _persist_step_summary(
+        summary_path=summary_path,
+        refs_path=refs_path,
+        payload={
+            "trace_id": resolved_trace_id,
+            "task_id": effective_task_id,
+            "phase_id": phase_id,
+            "subtask_id": _normalize_runtime_subtask_id(subtask_id),
+            "role_dir": role_dir,
+            "sub_role": sub_role,
+            "attempt": attempt,
+            "status": str(status),
+            "saved_at": created_at,
+        },
+    )
+    return step_ref
+
+
+def persist_guardrail_artifacts(
+    *,
+    step_ref: RuntimeStepRef | None,
+    trace_id: str | None,
+    guardrail_payload: dict[str, Any],
+    route_decision: str,
+    feedback: str,
+) -> RuntimeArtifactRef | None:
+    if step_ref is None:
+        return None
+    summary_path = Path(str(step_ref["summary_path"]))
+    attempt_dir = summary_path.parent
+    refs_path = attempt_dir / "artifact_refs.json"
+    guardrail_path = attempt_dir / "guardrail_result.json"
+    created_at = datetime.now(UTC).isoformat()
+    _write_json_file(
+        guardrail_path,
+        {
+            **guardrail_payload,
+            "route_decision": route_decision,
+            "feedback": feedback,
+            "saved_at": created_at,
+        },
+    )
+    ref = _build_runtime_artifact_ref(
+        artifact_kind="guardrail_result",
+        path=guardrail_path,
+        phase_id=str(step_ref["phase_id"]),
+        subtask_id=str(step_ref.get("subtask_id") or ""),
+        sub_role=str(step_ref["sub_role"]),
+        attempt=int(step_ref["attempt"]),
+        created_at=created_at,
+        trace_id=ensure_trace_id(trace_id),
+    )
+    refs = [*_load_runtime_artifact_refs(refs_path), ref]
+    _write_json_file(refs_path, refs)
+    summary_payload = json.loads(summary_path.read_text()) if summary_path.exists() else {}
+    summary_payload.update(
+        {
+            "guardrail_status": str(guardrail_payload.get("status") or ""),
+            "guardrail_warnings": list(guardrail_payload.get("warnings") or []),
+            "route_decision": route_decision,
+            "latest_guardrail_feedback": feedback,
+        }
+    )
+    _persist_step_summary(summary_path=summary_path, refs_path=refs_path, payload=summary_payload)
+    return ref
+
+
+def persist_task_unit_result_artifact(
+    *,
+    step_ref: RuntimeStepRef | None,
+    trace_id: str | None,
+    task_unit_result: Any,
+) -> RuntimeArtifactRef | None:
+    if step_ref is None:
+        return None
+    summary_path = Path(str(step_ref["summary_path"]))
+    attempt_dir = summary_path.parent
+    refs_path = attempt_dir / "artifact_refs.json"
+    result_path = attempt_dir / "task_unit_result.json"
+    created_at = datetime.now(UTC).isoformat()
+    _write_json_file(result_path, task_unit_result)
+    ref = _build_runtime_artifact_ref(
+        artifact_kind="task_unit_result",
+        path=result_path,
+        phase_id=str(step_ref["phase_id"]),
+        subtask_id=str(step_ref.get("subtask_id") or ""),
+        sub_role=str(step_ref["sub_role"]),
+        attempt=int(step_ref["attempt"]),
+        created_at=created_at,
+        trace_id=ensure_trace_id(trace_id),
+    )
+    refs = [*_load_runtime_artifact_refs(refs_path), ref]
+    _write_json_file(refs_path, refs)
+    summary_payload = json.loads(summary_path.read_text()) if summary_path.exists() else {}
+    summary_payload.update(
+        {
+            "task_unit_result_status": str(getattr(task_unit_result, "status", "")),
+            "task_unit_warnings": list(getattr(task_unit_result, "warnings", []) or []),
+            "completed_at": created_at,
+        }
+    )
+    _persist_step_summary(summary_path=summary_path, refs_path=refs_path, payload=summary_payload)
+    return ref
+
+
+def persist_human_gate_artifact(
+    *,
+    task_context: dict[str, Any],
+    phase_id: str,
+    subtask_id: str | None,
+    attempt: int,
+    trace_id: str | None,
+    artifact_kind: str,
+    payload: dict[str, Any],
+    summary_path: str | None = None,
+) -> RuntimeArtifactRef | None:
+    resolved_trace_id = ensure_trace_id(trace_id)
+    created_at = datetime.now(UTC).isoformat()
+    target_summary_path = Path(summary_path) if summary_path else None
+    if target_summary_path is not None:
+        attempt_dir = target_summary_path.parent
+    else:
+        task_id = str(task_context.get("task_id") or "").strip()
+        task_dir_path = str(task_context.get("task_dir_path") or "").strip()
+        if not task_id and not task_dir_path:
+            return None
+        effective_task_id = task_id or Path(task_dir_path).name
+        attempt_dir = resolve_step_attempt_directory(
+            task_id=effective_task_id,
+            phase_id=phase_id,
+            subtask_id=subtask_id,
+            sub_role="human_gate",
+            attempt=attempt,
+            task_dir_path=task_dir_path or None,
+        )
+    attempt_dir.mkdir(parents=True, exist_ok=True)
+    artifact_path = attempt_dir / f"{artifact_kind}.json"
+    _write_json_file(artifact_path, {**payload, "saved_at": created_at})
+    ref = _build_runtime_artifact_ref(
+        artifact_kind=artifact_kind,
+        path=artifact_path,
+        phase_id=phase_id,
+        subtask_id=subtask_id,
+        sub_role="human_gate",
+        attempt=attempt,
+        created_at=created_at,
+        trace_id=resolved_trace_id,
+    )
+    refs_path = attempt_dir / "artifact_refs.json"
+    summary_file = attempt_dir / "step_summary.json"
+    if refs_path.exists():
+        refs = [*_load_runtime_artifact_refs(refs_path), ref]
+        _write_json_file(refs_path, refs)
+        if summary_file.exists():
+            summary_payload = json.loads(summary_file.read_text())
+            if isinstance(summary_payload, dict):
+                _persist_step_summary(summary_path=summary_file, refs_path=refs_path, payload=summary_payload)
+    return ref
+
+
+def persist_cleanup_manifest(
+    *,
+    state: dict[str, Any],
+    trace_id: str | None,
+) -> RuntimeArtifactRef | None:
+    task_id = str(state.get("task_id") or "").strip()
+    task_dir_path = str(state.get("task_dir_path") or "").strip()
+    if not task_id and not task_dir_path:
+        return None
+    effective_task_id = task_id or Path(task_dir_path).name
+    cleanup_dir = _resolve_effective_task_directory(task_id=effective_task_id, task_dir_path=task_dir_path) / "runtime_artifacts" / "cleanup"
+    cleanup_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = cleanup_dir / "cleanup_manifest.json"
+    created_at = datetime.now(UTC).isoformat()
+    payload = {
+        "task_id": task_id,
+        "trace_id": ensure_trace_id(trace_id),
+        "saved_at": created_at,
+        "task_dir_path": state.get("task_dir_path"),
+        "task_worktree_root": state.get("task_worktree_root"),
+        "task_workspace_repos": state.get("task_workspace_repos", {}),
+        "methodology_root_runtime": state.get("methodology_root_runtime"),
+        "cleanup_requires_explicit_user_approval": True,
+    }
+    _write_json_file(manifest_path, payload)
+    return _build_runtime_artifact_ref(
+        artifact_kind="cleanup_manifest",
+        path=manifest_path,
+        phase_id=str(state.get("current_phase") or "validate"),
+        subtask_id=None,
+        sub_role="cleanup",
+        attempt=1,
+        created_at=created_at,
+        trace_id=ensure_trace_id(trace_id),
+    )
+
+
+def read_runtime_step_summary(path: str) -> dict[str, Any]:
+    loaded = json.loads(Path(path).read_text())
+    return loaded if isinstance(loaded, dict) else {}
+
+
+# SEM_BEGIN orchestrator_v1.tasks_storage.apply_task_artifact_writes:v1
+# type: METHOD
+# use_case: Applies runtime-controlled full-file task artifact writes returned by a driver payload.
+# feature:
+#   - Planner and supervisor can update TASK.md or subtask cards without OpenHands by returning full replacement content
+#   - Runtime keeps filesystem mutation deterministic and bounded to declared task artifacts
+# pre:
+#   - payload may contain task_artifact_writes list
+# post:
+#   - writes only allowed task artifact files and returns validation warnings for skipped items
+# invariant:
+#   - only task_card_path and subtask_card_path from task_context are writable through this helper
+# modifies (internal):
+#   - file.task_history
+# emits (external):
+#   -
+# errors:
+#   -
+# depends:
+#   - Path.write_text
+# sft: apply runtime-controlled full file task artifact writes from a driver payload while validating target paths
+# idempotent: false
+# logs: query: task artifact write path
+def apply_task_artifact_writes(
+    *,
+    task_context: dict[str, Any],
+    payload: dict[str, Any],
+) -> list[str]:
+    raw_writes = payload.get("task_artifact_writes")
+    if not isinstance(raw_writes, list):
+        return []
+
+    warnings: list[str] = []
+    allowed_paths = {
+        str(Path(path_value).resolve())
+        for path_value in (
+            task_context.get("task_card_path"),
+            task_context.get("subtask_card_path"),
+        )
+        if path_value
+    }
+    trace_id = ensure_trace_id(task_context.get("trace_id"))
+
+    for index, raw_write in enumerate(raw_writes, start=1):
+        if not isinstance(raw_write, dict):
+            warnings.append(f"task_artifact_writes[{index}] must be a mapping")
+            continue
+        target_path = str(raw_write.get("path") or "").strip()
+        mode = str(raw_write.get("mode") or "").strip().lower()
+        content = raw_write.get("content")
+        if not target_path or not isinstance(content, str):
+            warnings.append(f"task_artifact_writes[{index}] must contain string path and content")
+            continue
+        resolved_target = str(Path(target_path).resolve())
+        if resolved_target not in allowed_paths:
+            warnings.append(f"task_artifact_writes[{index}] targets a non-task artifact path: {target_path}")
+            continue
+        if mode != "full_replace":
+            warnings.append(f"task_artifact_writes[{index}] uses unsupported mode: {mode or '<empty>'}")
+            continue
+        target = Path(resolved_target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+        logger.info(
+            "[TasksStorage][apply_task_artifact_writes][StepComplete] trace_id=%s | "
+            "Task artifact written. path=%s, mode=%s",
+            trace_id,
+            target,
+            mode,
+        )
+    return warnings
+
+
+# SEM_END orchestrator_v1.tasks_storage.apply_task_artifact_writes:v1
 
 
 # SEM_BEGIN orchestrator_v1.tasks_storage.serialize_structured_output:v1
@@ -642,7 +1279,7 @@ def sync_task_cards_from_structured_output(
 # post:
 #   - writes one JSON artifact to disk and returns its path
 # invariant:
-#   - existing task artifacts are not overwritten because filenames include timestamp and sub-role
+#   - existing task artifacts are not overwritten because filenames include timestamp, sub-role, and a unique suffix
 # modifies (internal):
 #   - file.task_history
 # emits (external):
@@ -698,7 +1335,8 @@ def persist_openhands_conversation_artifact(
     artifact_dir = Path(str(conversation_dir_value)) / phase_id / subtask_id
     artifact_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    artifact_path = artifact_dir / f"{timestamp}__{sub_role}__{conversation_id}.json"
+    artifact_nonce = uuid4().hex[:8]
+    artifact_path = artifact_dir / f"{timestamp}__{sub_role}__{conversation_id}__{artifact_nonce}.json"
 
     logger.info(
         "[TasksStorage][persist_openhands_conversation_artifact][ContextAnchor] trace_id=%s | "

@@ -69,4 +69,5 @@ def test_sqlite_checkpoint_resume_after_human_gate(tmp_path, initial_state):
 
     resumed = app.invoke(Command(resume={"approved": True}), config)
     assert resumed["final_result"] == "Resumed from SQLite checkpoint"
+    assert resumed["human_decision_refs"]
     conn.close()

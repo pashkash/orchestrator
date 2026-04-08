@@ -3,9 +3,38 @@ runtime:
   docs_root_default: "/root/squadder-devops/docs"
   methodology_root_default: "/root/squadder-devops/docs"
   methodology_agents_entrypoint: "AGENTS.md"
+  role_metadata_path: "Technical Docs/common/roles/{role_dir}/role.yaml"
+  force_injected_common_documents:
+    - "Technical Docs/AGENTS.md"
+    - "Technical Docs/common/critical_concept_flow.md"
+    - "Technical Docs/common/common_rules.md"
+    - "Technical Docs/common/procedures/task_management.md"
+    - "Technical Docs/common/templates/task_template.md"
   prompts_root: "Technical Docs/common/roles"
   workspace_root_default: "/root/squadder-devops"
   tasks_root_default: "/root/management-stage/task-history"
+  task_repositories:
+    - id: "devops"
+      source_repo_root: "/root/squadder-devops"
+      branch_prefix: "task"
+      default_sparse_paths:
+        - "orchestrator"
+        - "docs"
+        - "business-docs"
+      default_for_roles:
+        - "devops"
+        - "architect"
+    - id: "backend-prod"
+      source_repo_root: "/root/dev-prod-squadder/app"
+      branch_prefix: "task"
+      default_sparse_paths:
+        - "src"
+        - "config"
+        - "migrations"
+        - "tests"
+        - "translations"
+      default_for_roles:
+        - "backend"
   openhands:
     base_url_env: "OPENHANDS_BASE_URL"
     base_url_default: "http://127.0.0.1:8011"
@@ -15,11 +44,25 @@ runtime:
     poll_interval_seconds: 2
     max_poll_interval_seconds: 15
     poll_log_every_n_attempts: 5
-    timeout_seconds: 180
+    timeout_seconds: 360
     cli_mode: true
     tools:
       - "terminal"
       - "file_editor"
+  direct_llm:
+    llm_api_key_env: "OPENROUTER_API_KEY"
+    llm_base_url: "https://openrouter.ai/api/v1"
+    timeout_seconds: 120
+    idle_timeout_seconds: 15
+    max_attempts: 3
+    retry_backoff_seconds: 2
+  langchain_tools:
+    llm_api_key_env: "OPENROUTER_API_KEY"
+    llm_base_url: "https://openrouter.ai/api/v1"
+    timeout_seconds: 180
+    max_iterations: 8
+    shell_timeout_seconds: 20
+    max_output_chars: 12000
 
 phases:
   collect:
@@ -32,21 +75,27 @@ phases:
         prompt:
           sub_role: executor
           path: "Technical Docs/common/roles/collector/executor.md"
+        execution:
+          backend: "langchain_tools"
+          strategy: "collector_context_builder"
         model: "openrouter/z-ai/glm-5"
         max_retries: 2
         guardrails:
           - ensure_required_fields
           - ensure_non_empty_payload
+          - ensure_checklist
       reviewer:
         role_dir: collector
         prompt:
           sub_role: reviewer
           path: "Technical Docs/common/roles/collector/reviewer.md"
+        execution:
+          backend: "direct_llm"
+          strategy: "review_collector_context"
         model: "openrouter/z-ai/glm-5"
         max_retries: 1
         guardrails:
-          - ensure_status_field
-          - ensure_feedback_field
+          - ensure_checklist
       tester: null
 
   plan:
@@ -59,21 +108,27 @@ phases:
         prompt:
           sub_role: executor
           path: "Technical Docs/common/roles/supervisor/executor.md"
+        execution:
+          backend: "direct_llm"
+          strategy: "planner_full_task_card"
         model: "openrouter/z-ai/glm-5"
         max_retries: 2
         guardrails:
           - ensure_required_fields
           - ensure_plan_payload
+          - ensure_checklist
       reviewer:
         role_dir: supervisor
         prompt:
           sub_role: reviewer
           path: "Technical Docs/common/roles/supervisor/reviewer.md"
+        execution:
+          backend: "direct_llm"
+          strategy: "review_plan"
         model: "openrouter/z-ai/glm-5"
         max_retries: 1
         guardrails:
-          - ensure_status_field
-          - ensure_feedback_field
+          - ensure_checklist
       tester: null
 
   execute:
@@ -88,6 +143,9 @@ phases:
         prompt:
           sub_role: executor
           path: "Technical Docs/common/roles/{role_dir}/executor.md"
+        execution:
+          backend: "openhands"
+          strategy: "task_worker"
         model: "openrouter/z-ai/glm-5"
         max_retries: 3
         guardrails:
@@ -98,21 +156,28 @@ phases:
         prompt:
           sub_role: reviewer
           path: "Technical Docs/common/roles/{role_dir}/reviewer.md"
+        execution:
+          backend: "direct_llm"
+          strategy: "review_worker_result"
+          runtime_overrides:
+            timeout_seconds: 300
+            idle_timeout_seconds: 45
         model: "openrouter/z-ai/glm-5"
         max_retries: 2
         guardrails:
-          - ensure_status_field
-          - ensure_feedback_field
+          - ensure_checklist
       tester:
         role_dir: "{role_dir}"
         prompt:
           sub_role: tester
           path: "Technical Docs/common/roles/{role_dir}/tester.md"
+        execution:
+          backend: "langchain_tools"
+          strategy: "runtime_validation"
         model: "openrouter/z-ai/glm-5"
         max_retries: 1
         guardrails:
-          - ensure_status_field
-          - ensure_tests_summary
+          - ensure_checklist
 
   validate:
     phase: validate
@@ -124,19 +189,25 @@ phases:
         prompt:
           sub_role: executor
           path: "Technical Docs/common/roles/supervisor/executor.md"
+        execution:
+          backend: "direct_llm"
+          strategy: "final_validation"
         model: "openrouter/z-ai/glm-5"
         max_retries: 1
         guardrails:
           - ensure_required_fields
           - ensure_validate_payload
+          - ensure_checklist
       reviewer:
         role_dir: supervisor
         prompt:
           sub_role: reviewer
           path: "Technical Docs/common/roles/supervisor/reviewer.md"
+        execution:
+          backend: "direct_llm"
+          strategy: "review_validation"
         model: "openrouter/z-ai/glm-5"
         max_retries: 1
         guardrails:
-          - ensure_status_field
-          - ensure_feedback_field
+          - ensure_checklist
       tester: null

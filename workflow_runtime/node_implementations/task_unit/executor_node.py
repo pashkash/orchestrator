@@ -8,7 +8,7 @@ from workflow_runtime.agent_drivers.base_driver import BaseDriver, DriverRequest
 from workflow_runtime.graph_compiler.state_schema import PhaseId, SubRole
 from workflow_runtime.graph_compiler.yaml_manifest_parser import PipelineStepConfig
 from workflow_runtime.integrations.observability import ensure_trace_id
-from workflow_runtime.integrations.prompt_composer import compose_prompt
+from workflow_runtime.integrations.prompt_composer import compose_prompt, compose_prompt_parts
 from workflow_runtime.integrations.runtime_logging import get_logger
 
 
@@ -59,22 +59,33 @@ def run_executor_step(
         role_dir,
         step_config.model,
     )
-    prompt = compose_prompt(
+    system_prompt, user_prompt = compose_prompt_parts(
         phase_id=phase_id,
         role_dir=role_dir,
         step_config=step_config,
         task_context=task_context,
     )
+    full_prompt = system_prompt + "\n\n" + user_prompt
+    request_metadata = dict(metadata)
+    runtime_overrides = dict(step_config.execution.runtime_overrides)
+    if runtime_overrides:
+        existing_overrides = request_metadata.get("execution_runtime_overrides")
+        merged_overrides = dict(existing_overrides) if isinstance(existing_overrides, dict) else {}
+        merged_overrides.update(runtime_overrides)
+        request_metadata["execution_runtime_overrides"] = merged_overrides
     result = driver.run_task(
         DriverRequest(
             phase_id=phase_id,
             role_dir=role_dir,
             sub_role=SubRole.EXECUTOR,
+            execution_backend=step_config.execution.backend,
+            execution_strategy=step_config.execution.strategy,
             model=step_config.model,
-            prompt=prompt,
+            prompt=full_prompt,
+            system_prompt=system_prompt,
             task_context=task_context,
             working_dir=working_dir,
-            metadata=metadata,
+            metadata=request_metadata,
         )
     )
     logger.info(
@@ -85,7 +96,26 @@ def run_executor_step(
         role_dir,
         result.status,
     )
-    return result
+    return DriverResult(
+        status=result.status,
+        payload=result.payload,
+        raw_text=result.raw_text,
+        conversation_id=result.conversation_id,
+        request_artifact={
+            "phase_id": str(phase_id),
+            "role_dir": role_dir,
+            "sub_role": SubRole.EXECUTOR.value,
+            "model": step_config.model,
+            "execution_backend": str(step_config.execution.backend),
+            "execution_strategy": step_config.execution.strategy,
+            "working_dir": working_dir,
+            "metadata": request_metadata,
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
+            "full_prompt": full_prompt,
+        },
+        artifact_refs=result.artifact_refs,
+    )
 
 
 # SEM_END orchestrator_v1.executor_node.run_executor_step:v1

@@ -13,8 +13,8 @@ from workflow_runtime.graph_compiler.state_schema import (
 from workflow_runtime.integrations.phase_config_loader import get_runtime_config
 from workflow_runtime.node_implementations.phases.execute_phase import run_execute_phase
 from workflow_runtime.node_implementations.phases.plan_phase import _merge_plan
-from workflow_runtime.node_implementations.task_unit.runner import (
-    TaskUnitRunner,
+from workflow_runtime.node_implementations.task_unit.runner import TaskUnitRunner
+from workflow_runtime.node_implementations.task_unit.task_unit_graph import (
     _structured_output_from_payload,
 )
 from tests.mocks import ScriptedDriver
@@ -125,6 +125,17 @@ def test_execute_phase_escalates_after_retry_budget_exhausted(task_artifacts):
         "user_request": "Create square.py",
         "workspace_root": "/root/squadder-devops",
         "task_worktree_root": task_artifacts["task_worktree_root"],
+        "primary_workspace_repo_id": "devops",
+        "source_workspace_roots": {
+            "devops": "/root/squadder-devops",
+            "backend-prod": "/root/dev-prod-squadder/app",
+        },
+        "role_workspace_repo_map": {
+            "devops": "devops",
+            "architect": "devops",
+            "backend": "backend-prod",
+        },
+        "task_workspace_repos": task_artifacts["task_workspace_repos"],
         "trace_id": "test-execute-escalation",
         "task_dir_path": task_artifacts["task_dir_path"],
         "task_card_path": task_artifacts["task_card_path"],
@@ -196,6 +207,17 @@ def test_execute_phase_escalates_when_task_unit_consumes_full_executor_budget(ta
         "user_request": "Create square.py",
         "workspace_root": "/root/squadder-devops",
         "task_worktree_root": task_artifacts["task_worktree_root"],
+        "primary_workspace_repo_id": "devops",
+        "source_workspace_roots": {
+            "devops": "/root/squadder-devops",
+            "backend-prod": "/root/dev-prod-squadder/app",
+        },
+        "role_workspace_repo_map": {
+            "devops": "devops",
+            "architect": "devops",
+            "backend": "backend-prod",
+        },
+        "task_workspace_repos": task_artifacts["task_workspace_repos"],
         "trace_id": "test-execute-attempt-budget",
         "task_dir_path": task_artifacts["task_dir_path"],
         "task_card_path": task_artifacts["task_card_path"],
@@ -236,6 +258,17 @@ def test_execute_phase_does_not_false_pass_when_only_blocked_subtasks_remain(tas
         "user_request": "Create square.py",
         "workspace_root": "/root/squadder-devops",
         "task_worktree_root": task_artifacts["task_worktree_root"],
+        "primary_workspace_repo_id": "devops",
+        "source_workspace_roots": {
+            "devops": "/root/squadder-devops",
+            "backend-prod": "/root/dev-prod-squadder/app",
+        },
+        "role_workspace_repo_map": {
+            "devops": "devops",
+            "architect": "devops",
+            "backend": "backend-prod",
+        },
+        "task_workspace_repos": task_artifacts["task_workspace_repos"],
         "trace_id": "test-execute-blocked-plan",
         "task_dir_path": task_artifacts["task_dir_path"],
         "task_card_path": task_artifacts["task_card_path"],

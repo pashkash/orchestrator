@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
-import re
+import os
 from typing import Any
 
-import yaml
-from lmnr import observe
+from lmnr import Laminar, observe
 
 from workflow_runtime.agent_drivers.base_driver import BaseDriver, DriverRequest, DriverResult
+from workflow_runtime.agent_drivers.yaml_contract import (
+    coerce_payload,
+    normalize_payload_shape,
+    normalize_status,
+    status_for_parse_failure,
+)
 from workflow_runtime.graph_compiler.state_schema import PipelineStatus, SubRole
 from workflow_runtime.integrations.observability import ensure_trace_id
-from workflow_runtime.integrations.openhands_http_api import OpenHandsHttpApi
+from workflow_runtime.integrations.openhands_http_api import OpenHandsConversationHandle, OpenHandsHttpApi
 from workflow_runtime.integrations.openhands_runtime import (
     OPENHANDS_EVENT_SEARCH_LIMIT_MAX,
     OpenHandsExecutionStatus,
@@ -22,9 +27,6 @@ from workflow_runtime.integrations.tasks_storage import persist_openhands_conver
 
 
 logger = get_logger(__name__)
-
-_YAML_BLOCK_RE = re.compile(r"```(?:yaml|yml)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
-
 
 # SEM_BEGIN orchestrator_v1.openhands_driver._extract_texts:v1
 # type: METHOD
@@ -103,111 +105,161 @@ def _extract_agent_reply_texts(events: list[dict[str, Any]] | Any) -> list[str]:
 # SEM_END orchestrator_v1.openhands_driver._extract_agent_reply_texts:v1
 
 
-# SEM_BEGIN orchestrator_v1.openhands_driver._coerce_payload:v1
+# SEM_BEGIN orchestrator_v1.openhands_driver._truncate_span_text:v1
 # type: METHOD
-# use_case: Extracts the first valid YAML object from the OpenHands agent text response.
+# use_case: Ограничивает большой текст перед записью в observability span.
 # feature:
-#   - OpenHands agent may return text interleaved with YAML blocks
+#   - Laminar span attrs/output не должны раздуваться целыми OH payload'ами
 # pre:
-#   - raw_text is not empty
+#   -
 # post:
-#   - returns a parsed dict from the last YAML block or None when parsing fails
+#   - returns a bounded string suitable for span input/output
 # invariant:
-#   - raw_text is not mutated
-# modifies (internal):
-#   -
-# emits (external):
-#   -
-# errors:
-#   -
-# depends:
-#   - yaml.safe_load
-# sft: extract the last valid YAML mapping from OpenHands agent raw text response and return None on parse failure
+#   - исходная строка семантически не меняется кроме усечения
+# sft: shorten verbose OpenHands text fragments before attaching them to Laminar spans
 # idempotent: true
 # logs: -
-def _coerce_payload(raw_text: str) -> dict[str, Any] | None:
-    blocks = _YAML_BLOCK_RE.findall(raw_text)
-    candidates = list(reversed(blocks)) if blocks else [raw_text]
-    for candidate in candidates:
-        try:
-            loaded = yaml.safe_load(candidate)
-        except yaml.YAMLError:
-            continue
-        if isinstance(loaded, dict):
-            return loaded
-    return None
+def _truncate_span_text(text: str, *, limit: int = 1200) -> str:
+    normalized = text.strip()
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[:limit] + "...[truncated]"
 
 
-# SEM_END orchestrator_v1.openhands_driver._coerce_payload:v1
+# SEM_END orchestrator_v1.openhands_driver._truncate_span_text:v1
 
 
-# SEM_BEGIN orchestrator_v1.openhands_driver._status_for_parse_failure:v1
-# type: METHOD
-# use_case: Maps parse failures to the phase-specific fix status expected by TaskUnit.
-# feature:
-#   - Reviewer and tester parse failures must not collapse into executor repair statuses
-# pre:
-#   - sub_role is one of executor/reviewer/tester
-# post:
-#   - returns the correct NEEDS_FIX_* PipelineStatus for that sub-role
-# invariant:
-#   - no runtime state is mutated
-# modifies (internal):
-#   -
-# emits (external):
-#   -
-# errors:
-#   -
-# depends:
-#   - PipelineStatus
-#   - SubRole
-# sft: map one task unit sub-role to the corresponding parse-failure pipeline status
-# idempotent: true
-# logs: -
-def _status_for_parse_failure(sub_role: SubRole) -> PipelineStatus:
-    if sub_role == SubRole.REVIEWER:
-        return PipelineStatus.NEEDS_FIX_REVIEW
-    if sub_role == SubRole.TESTER:
-        return PipelineStatus.NEEDS_FIX_TESTS
-    return PipelineStatus.NEEDS_FIX_EXECUTOR
+def _is_truthy_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
-# SEM_END orchestrator_v1.openhands_driver._status_for_parse_failure:v1
-
-
-_STATUS_ALIASES: dict[str, PipelineStatus] = {
-    "done": PipelineStatus.PASS,
-    "success": PipelineStatus.PASS,
-    "ok": PipelineStatus.PASS,
-    "completed": PipelineStatus.PASS,
-    "ready": PipelineStatus.PASS,
-    "finished": PipelineStatus.PASS,
-    "failed": PipelineStatus.NEEDS_FIX_EXECUTOR,
-    "error": PipelineStatus.NEEDS_FIX_EXECUTOR,
-    "fix": PipelineStatus.NEEDS_FIX_EXECUTOR,
-}
-
-
-def _normalize_status(raw_status: str, sub_role: SubRole) -> PipelineStatus:
-    """Normalize agent-returned status string into a valid PipelineStatus."""
-    upper = raw_status.strip().upper()
-    try:
-        return PipelineStatus(upper)
-    except ValueError:
-        pass
-    alias = _STATUS_ALIASES.get(raw_status.strip().lower())
-    if alias:
-        logger.info(
-            "[OpenHandsDriver][_normalize_status] Mapped alias '%s' -> %s",
-            raw_status,
-            alias,
-        )
-        return alias
-    logger.warning(
-        "[OpenHandsDriver][_normalize_status] Unknown status '%s', falling back to NEEDS_FIX",
-        raw_status,
+def _should_emit_synthetic_openhands_spans(request: DriverRequest) -> bool:
+    return _is_truthy_flag(request.metadata.get("emit_synthetic_openhands_fallback_spans")) or _is_truthy_flag(
+        os.getenv("OPENHANDS_SYNTHETIC_FALLBACK_SPANS")
     )
-    return _status_for_parse_failure(sub_role)
+
+
+# SEM_BEGIN orchestrator_v1.openhands_driver._emit_openhands_event_spans:v1
+# type: METHOD
+# use_case: Воссоздаёт детальные OpenHands step spans из event timeline под текущим span'ом orchestrator.
+# feature:
+#   - Если remote OpenHands trace linkage потерян, action/observation steps всё равно видны в Laminar дерева orchestrator run
+# pre:
+#   - event_items is a list of OpenHands event dicts
+# post:
+#   - agent action events are mirrored into child Laminar spans with paired observation output when available
+# invariant:
+#   - source OpenHands events are not mutated
+# modifies (internal):
+#   -
+# emits (external):
+#   - external.laminar
+# errors:
+#   -
+# depends:
+#   - Laminar
+# sft: synthesize per-step Laminar spans from OpenHands action and observation events
+# idempotent: true
+# logs: -
+def _emit_openhands_event_spans(
+    event_items: list[dict[str, Any]] | Any,
+    *,
+    trace_id: str,
+    phase_id: str,
+    role_dir: str,
+    sub_role: str,
+    conversation_id: str,
+) -> None:
+    if not isinstance(event_items, list):
+        return
+
+    observations_by_action_id: dict[str, dict[str, Any]] = {}
+    for event in event_items:
+        if not isinstance(event, dict):
+            continue
+        if str(event.get("source") or "").lower() != "environment":
+            continue
+        action_id = str(event.get("action_id") or "").strip()
+        if action_id:
+            observations_by_action_id[action_id] = event
+
+    for index, event in enumerate(event_items):
+        if not isinstance(event, dict):
+            continue
+        if str(event.get("source") or "").lower() != "agent":
+            continue
+        action = event.get("action")
+        if not isinstance(action, dict):
+            continue
+
+        tool_name = str(event.get("tool_name") or "").strip().lower()
+        action_kind = str(action.get("kind") or "").strip()
+        step_kind = tool_name or action_kind.removesuffix("Action").lower() or "agent"
+        step_name = f"openhands_fallback_step_{step_kind}"
+        event_id = str(event.get("id") or "").strip()
+        summary = str(event.get("summary") or action.get("message") or "").strip()
+        reasoning = str(event.get("reasoning_content") or "").strip()
+        span_input = {
+            "trace_id": trace_id,
+            "conversation_id": conversation_id,
+            "phase_id": phase_id,
+            "role_dir": role_dir,
+            "sub_role": sub_role,
+            "event_index": index,
+            "event_id": event_id,
+            "tool_name": tool_name or None,
+            "action_kind": action_kind or None,
+            "summary": _truncate_span_text(summary) if summary else None,
+            "reasoning": _truncate_span_text(reasoning) if reasoning else None,
+        }
+
+        step_span = Laminar.start_active_span(name=step_name, input=span_input)
+        try:
+            Laminar.set_span_attributes(
+                {
+                    "openhands.trace_id": trace_id,
+                    "openhands.phase_id": phase_id,
+                    "openhands.role_dir": role_dir,
+                    "openhands.sub_role": sub_role,
+                    "openhands.conversation_id": conversation_id,
+                    "openhands.event_id": event_id,
+                    "openhands.event_timestamp": str(event.get("timestamp") or ""),
+                    "openhands.event_kind": str(event.get("kind") or ""),
+                    "openhands.action_kind": action_kind,
+                    "openhands.tool_name": tool_name,
+                    "openhands.tool_call_id": str(event.get("tool_call_id") or ""),
+                    "openhands.synthetic_fallback": True,
+                }
+            )
+
+            observation = observations_by_action_id.get(event_id)
+            if observation is not None:
+                observation_payload = observation.get("observation")
+                observation_text = "\n\n".join(_extract_texts(observation_payload)).strip()
+                Laminar.set_span_output(
+                    {
+                        "observation_kind": str((observation_payload or {}).get("kind") or ""),
+                        "is_error": bool((observation_payload or {}).get("is_error")),
+                        "timestamp": str(observation.get("timestamp") or ""),
+                        "text": _truncate_span_text(observation_text) if observation_text else "",
+                    }
+                )
+            elif summary or reasoning:
+                Laminar.set_span_output(
+                    {
+                        "summary": _truncate_span_text(summary) if summary else "",
+                        "reasoning": _truncate_span_text(reasoning) if reasoning else "",
+                    }
+                )
+        finally:
+            step_span.end()
+
+
+# SEM_END orchestrator_v1.openhands_driver._emit_openhands_event_spans:v1
 
 
 # SEM_BEGIN orchestrator_v1.openhands_driver.openhands_driver:v1
@@ -300,15 +352,17 @@ class OpenHandsDriver(BaseDriver):
     @observe(name="openhands_run_task")
     def run_task(self, request: DriverRequest) -> DriverResult:
         trace_id = ensure_trace_id(request.metadata.get("trace_id"))
+        reuse_conversation_id = str(request.metadata.get("reuse_conversation_id") or "").strip()
 
         logger.info(
             "[OpenHandsDriver][run_task][ContextAnchor] trace_id=%s | "
-            "Running driver task. phase=%s, role_dir=%s, sub_role=%s, model=%s",
+            "Running driver task. phase=%s, role_dir=%s, sub_role=%s, model=%s, reuse_conversation_id=%s",
             trace_id,
             request.phase_id,
             request.role_dir,
             request.sub_role,
             request.model,
+            reuse_conversation_id or "-",
         )
 
         # === PRE[0]: request.prompt not empty ===
@@ -349,11 +403,33 @@ class OpenHandsDriver(BaseDriver):
                 "run": False,
             },
         }
+        followup_payload = {
+            "role": "user",
+            "content": [{"type": "text", "text": request.prompt}],
+            "run": False,
+        }
 
         try:
-            handle = self._api.create_conversation(payload, trace_id=trace_id)
+            if reuse_conversation_id:
+                logger.info(
+                    "[OpenHandsDriver][run_task][DecisionPoint] trace_id=%s | "
+                    "Branch: reuse_conversation. Reason: conversation_id=%s",
+                    trace_id,
+                    reuse_conversation_id,
+                )
+                self._api.send_message(
+                    reuse_conversation_id,
+                    followup_payload,
+                    trace_id=trace_id,
+                )
+                handle = OpenHandsConversationHandle(
+                    conversation_id=reuse_conversation_id,
+                    state={"id": reuse_conversation_id, "execution_status": OpenHandsExecutionStatus.IDLE.value},
+                )
+            else:
+                handle = self._api.create_conversation(payload, trace_id=trace_id)
             initial_status = normalize_openhands_execution_status(handle.state.get("execution_status"))
-            if initial_status in {None, OpenHandsExecutionStatus.IDLE}:
+            if reuse_conversation_id or initial_status in {None, OpenHandsExecutionStatus.IDLE}:
                 self._api.run_conversation(handle.conversation_id, trace_id=trace_id)
             state = self._api.wait_until_finished(handle.conversation_id, trace_id=trace_id)
             events = self._api.search_events(
@@ -372,6 +448,15 @@ class OpenHandsDriver(BaseDriver):
             )
 
             event_items = events.get("items", events) if isinstance(events, dict) else events
+            if _should_emit_synthetic_openhands_spans(request):
+                _emit_openhands_event_spans(
+                    event_items,
+                    trace_id=trace_id,
+                    phase_id=str(request.phase_id),
+                    role_dir=request.role_dir,
+                    sub_role=str(request.sub_role),
+                    conversation_id=handle.conversation_id,
+                )
             agent_texts = _extract_agent_reply_texts(event_items)
             raw_text = "\n\n".join(agent_texts).strip() if agent_texts else ""
 
@@ -385,7 +470,7 @@ class OpenHandsDriver(BaseDriver):
                     request.sub_role,
                     handle.conversation_id,
                 )
-                status = _status_for_parse_failure(request.sub_role)
+                status = status_for_parse_failure(request.sub_role)
                 parsed_payload = {
                     "status": str(status),
                     "warnings": [
@@ -394,15 +479,15 @@ class OpenHandsDriver(BaseDriver):
                     "execution_status": execution_status,
                 }
             elif not raw_text:
-                status = _status_for_parse_failure(request.sub_role)
+                status = status_for_parse_failure(request.sub_role)
                 parsed_payload = {
                     "status": str(status),
                     "warnings": ["OpenHands returned no parseable text output"],
                 }
             else:
-                parsed_payload = _coerce_payload(raw_text)
+                parsed_payload = coerce_payload(raw_text)
                 if parsed_payload is None:
-                    status = _status_for_parse_failure(request.sub_role)
+                    status = status_for_parse_failure(request.sub_role)
                     parsed_payload = {
                         "status": str(status),
                         "warnings": [
@@ -412,10 +497,15 @@ class OpenHandsDriver(BaseDriver):
                 else:
                     if "verdict" in parsed_payload and "status" not in parsed_payload:
                         parsed_payload["status"] = parsed_payload["verdict"]
+                    parsed_payload = normalize_payload_shape(
+                        request.phase_id,
+                        request.sub_role,
+                        parsed_payload,
+                    )
                     raw_status = str(parsed_payload.get("status") or PipelineStatus.PASS)
-                    status = _normalize_status(raw_status, request.sub_role)
+                    status = normalize_status(raw_status, request.sub_role)
 
-            persist_openhands_conversation_artifact(
+            conversation_artifact_path = persist_openhands_conversation_artifact(
                 task_context=request.task_context,
                 phase_id=str(request.phase_id),
                 role_dir=request.role_dir,
@@ -454,6 +544,11 @@ class OpenHandsDriver(BaseDriver):
             payload=parsed_payload,
             raw_text=raw_text,
             conversation_id=handle.conversation_id,
+            artifact_refs=(
+                {"openhands_conversation": str(conversation_artifact_path)}
+                if conversation_artifact_path is not None
+                else {}
+            ),
         )
 
     # SEM_END orchestrator_v1.openhands_driver.openhands_driver.run_task:v1

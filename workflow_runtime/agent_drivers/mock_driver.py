@@ -16,6 +16,21 @@ from workflow_runtime.integrations.runtime_logging import get_logger
 logger = get_logger(__name__)
 
 
+def _mock_checklist_resolutions(task_context: dict[str, Any]) -> list[dict[str, str]]:
+    checklist_items = task_context.get("guardrail_prompt_checklists", [])
+    if not isinstance(checklist_items, list):
+        return []
+    return [
+        {
+            "id": str(item.get("id") or ""),
+            "status": "done",
+            "evidence": "mock-driver-covered",
+        }
+        for item in checklist_items
+        if str(item.get("id") or "").strip()
+    ]
+
+
 # SEM_BEGIN orchestrator_v1.mock_driver.mock_driver:v1
 # type: CLASS
 # use_case: Deterministic runtime driver for tests and local dry-runs.
@@ -69,6 +84,7 @@ class MockDriver(BaseDriver):
     # logs: command: uv run pytest tests/ -v
     def run_task(self, request: DriverRequest) -> DriverResult:
         trace_id = str(request.metadata.get("trace_id") or "mock-trace")
+        checklist_resolutions = _mock_checklist_resolutions(request.task_context)
         logger.info(
             "[MockDriver][run_task][ContextAnchor] trace_id=%s | "
             "Resolving mock response. phase=%s, role_dir=%s, sub_role=%s",
@@ -88,6 +104,7 @@ class MockDriver(BaseDriver):
                 payload={
                     "status": PipelineStatus.PASS,
                     "feedback": f"Mock review PASS for {request.role_dir}/{request.phase_id}",
+                    "checklist_resolutions": checklist_resolutions,
                     "warnings": [],
                 },
                 raw_text="mock-review-pass",
@@ -115,6 +132,7 @@ class MockDriver(BaseDriver):
                     "status": PipelineStatus.PASS,
                     "result": f"Mock tests PASS for {request.role_dir}/{request.phase_id}",
                     "tests_passed": [f"{request.phase_id}-{request.role_dir}-ok"],
+                    "checklist_resolutions": checklist_resolutions,
                     "warnings": [],
                 },
                 raw_text="mock-tester-pass",
@@ -145,6 +163,7 @@ class MockDriver(BaseDriver):
                         "kubernetes": {"namespace": "squadder", "pods_unhealthy": []},
                         "runtime": {"mode": "mock"},
                     },
+                    "checklist_resolutions": checklist_resolutions,
                     "warnings": [],
                 },
                 raw_text="mock-collect-pass",
@@ -186,6 +205,7 @@ class MockDriver(BaseDriver):
                             "max_retries": 3,
                         },
                     ],
+                    "checklist_resolutions": checklist_resolutions,
                     "warnings": [],
                 },
                 raw_text="mock-plan-pass",
@@ -217,6 +237,7 @@ class MockDriver(BaseDriver):
                         "status": PipelineStatus.NEEDS_REPLAN,
                         "cross_cutting_result": PipelineStatus.NEEDS_REPLAN,
                         "final_result": None,
+                        "checklist_resolutions": checklist_resolutions,
                         "warnings": conflicts,
                     },
                     raw_text="mock-validate-replan",
@@ -242,6 +263,7 @@ class MockDriver(BaseDriver):
                     "status": PipelineStatus.PASS,
                     "cross_cutting_result": PipelineStatus.PASS,
                     "final_result": "Mock validation succeeded",
+                    "checklist_resolutions": checklist_resolutions,
                     "warnings": [],
                 },
                 raw_text="mock-validate-pass",
@@ -283,6 +305,7 @@ class MockDriver(BaseDriver):
                     "escalation": None,
                     "summary": f"Mock execution completed for {subtask_id}",
                 },
+                "checklist_resolutions": checklist_resolutions,
                 "warnings": [],
             },
             raw_text="mock-execute-pass",

@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
-from workflow_runtime.graph_compiler.state_schema import PhaseId, PipelineStatus, SubRole
+from workflow_runtime.graph_compiler.state_schema import ExecutionBackend, PhaseId, PipelineStatus, SubRole
 
 
 # SEM_BEGIN orchestrator_v1.base_driver.driver_request:v1
@@ -39,11 +39,14 @@ class DriverRequest:
     phase_id: PhaseId
     role_dir: str
     sub_role: SubRole
+    execution_backend: ExecutionBackend
+    execution_strategy: str | None
     model: str
     prompt: str
     task_context: dict[str, Any]
     working_dir: str
     metadata: dict[str, Any] = field(default_factory=dict)
+    system_prompt: str | None = None
 
 
 # SEM_END orchestrator_v1.base_driver.driver_request:v1
@@ -79,6 +82,8 @@ class DriverResult:
     payload: dict[str, Any] = field(default_factory=dict)
     raw_text: str = ""
     conversation_id: str | None = None
+    request_artifact: dict[str, Any] = field(default_factory=dict)
+    artifact_refs: dict[str, Any] = field(default_factory=dict)
 
 
 # SEM_END orchestrator_v1.base_driver.driver_result:v1

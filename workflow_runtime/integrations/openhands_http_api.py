@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -177,9 +178,19 @@ class OpenHandsHttpApi:
             ctx_str = Laminar.serialize_span_context()
             if ctx_str:
                 headers["x-lmnr-parent-ctx"] = ctx_str
-        except Exception:
-            pass
+                logger.info("_request: injected x-lmnr-parent-ctx len=%d for %s", len(ctx_str), path)
+            else:
+                logger.info("_request: no active Laminar span context for %s", path)
+        except Exception as exc:
+            logger.warning("_request: Laminar serialize failed for %s: %s", path, exc)
         response = self._client.request(method, path, json=json_body, headers=headers)
+        if response.headers.get("x-oh-lmnr-parent-ctx-captured") == "1":
+            logger.info(
+                "_request: server confirmed x-lmnr-parent-ctx capture for %s (stored_conversation_id=%s, span_link_status=%s)",
+                path,
+                response.headers.get("x-oh-lmnr-conversation-id-stored", "-"),
+                response.headers.get("x-oh-lmnr-span-link-status", "-"),
+            )
         response.raise_for_status()
         return response.json() if response.content else {}
 
@@ -491,32 +502,251 @@ class OpenHandsHttpApi:
 
     # SEM_END orchestrator_v1.openhands_http_api.openhands_http_api.search_events:v1
 
-    # SEM_BEGIN orchestrator_v1.openhands_http_api.wait_until_finished:v1
+    _EVENT_STREAM_TERMINAL_ACTION_KINDS = frozenset({
+        "finish",
+        "FinishAction",
+    })
+
+    # SEM_BEGIN orchestrator_v1.openhands_http_api.openhands_http_api._wait_events_websocket:v1
     # type: METHOD
-    # use_case: Polls an OpenHands conversation until it reaches a terminal status without aborting while progress continues.
+    # use_case: Ждёт завершение OpenHands conversation через events WebSocket и отдаёт финальное conversation state.
     # feature:
-    #   - Phase 3 driver must wait for the remote run to complete before parsing the result
-    #   - Long-running conversations must stay alive while execution_status or updated_at still change
-    #   - openhands/software-agent-sdk REST API
+    #   - event-driven wait убирает лишние паузы HTTP polling между OH этапами
+    #   - при недоступности websocket transport метод должен контролируемо деградировать в HTTP polling path
     # pre:
     #   - conversation_id is not empty
     # post:
-    #   - returns the latest terminal conversation state from the OpenHands server
+    #   - returns final conversation state when terminal event observed
+    #   - returns None when websocket path is unavailable and caller must use HTTP polling
     # invariant:
-    #   - client reuse is preserved
+    #   - OpenHands conversation state mutates only on remote service side
     # modifies (internal):
-    #   - external.openhands_server
+    #   -
     # emits (external):
-    #   - external.openhands_server
+    #   - external.openhands_websocket
     # errors:
-    #   - TimeoutError: idle timeout exceeded without conversation progress
+    #   - -
     # depends:
-    #   - get_conversation
-    # sft: wait for an OpenHands conversation to reach a terminal execution status using idle-timeout semantics
+    #   - websocket.create_connection
+    # sft: wait for openhands conversation completion via the events websocket and fall back to http polling when websocket is unavailable
     # idempotent: false
-    # logs: query: GET /api/conversations/{id}
-    def wait_until_finished(self, conversation_id: str, *, trace_id: str | None = None) -> dict[str, Any]:
-        resolved_trace_id = ensure_trace_id(trace_id)
+    # logs: query: OpenHandsHttpApi _wait_events_websocket
+    def _wait_events_websocket(
+        self,
+        conversation_id: str,
+        *,
+        trace_id: str,
+    ) -> dict[str, Any] | None:
+        """Attempt event-driven wait via the OpenHands events WebSocket.
+
+        Returns the final conversation state on success or ``None`` when the
+        WebSocket connection could not be established (caller falls back to
+        HTTP polling).
+        """
+        try:
+            import websocket
+        except ImportError:
+            logger.info(
+                "[OpenHandsHttpApi][_wait_events_websocket][DecisionPoint] trace_id=%s | "
+                "Branch: http_polling_fallback. Reason: websocket-client not installed. conversation_id=%s",
+                trace_id,
+                conversation_id,
+            )
+            return None
+
+        observed_event_count = 0
+        terminal_signal = ""
+        ws_base = self._base_url.replace("http://", "ws://").replace("https://", "wss://")
+        websocket_url = f"{ws_base}/sockets/events/{conversation_id}?resend_mode=all"
+        socket = None
+        try:
+            logger.info(
+                "[OpenHandsHttpApi][_wait_events_websocket][ExternalCall][BELIEF] trace_id=%s | "
+                "Attempting events websocket connect. conversation_id=%s, websocket_url=%s",
+                trace_id,
+                conversation_id,
+                websocket_url,
+            )
+            socket = websocket.create_connection(
+                websocket_url,
+                timeout=5,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[OpenHandsHttpApi][_wait_events_websocket][ErrorHandled][ERR:EXTERNAL] trace_id=%s | "
+                "Events websocket connection failed, falling back to HTTP polling. conversation_id=%s, error=%s",
+                trace_id,
+                conversation_id,
+                str(exc),
+            )
+            return None
+
+        logger.info(
+            "[OpenHandsHttpApi][_wait_events_websocket][ContextAnchor] trace_id=%s | "
+            "Events websocket connected, waiting for terminal event. conversation_id=%s, observed_event_count=%d",
+            trace_id,
+            conversation_id,
+            observed_event_count,
+        )
+
+        try:
+            wait_deadline = time.monotonic() + self._timeout_seconds
+            wait_completed = False
+            while time.monotonic() < wait_deadline:
+                remaining_seconds = max(1.0, min(5.0, wait_deadline - time.monotonic()))
+                socket.settimeout(remaining_seconds)
+                try:
+                    raw_message = socket.recv()
+                except websocket.WebSocketTimeoutException:
+                    continue
+                except websocket.WebSocketConnectionClosedException:
+                    logger.warning(
+                        "[OpenHandsHttpApi][_wait_events_websocket][DecisionPoint] trace_id=%s | "
+                        "Branch: websocket_closed. conversation_id=%s, observed_event_count=%d",
+                        trace_id,
+                        conversation_id,
+                        observed_event_count,
+                    )
+                    break
+
+                if isinstance(raw_message, bytes):
+                    raw_message = raw_message.decode("utf-8", errors="replace")
+                if not isinstance(raw_message, str) or not raw_message.strip():
+                    continue
+
+                try:
+                    event_payload = json.loads(raw_message)
+                except json.JSONDecodeError:
+                    logger.warning(
+                        "[OpenHandsHttpApi][_wait_events_websocket][ErrorHandled][ERR:DATA_INTEGRITY] trace_id=%s | "
+                        "Ignoring non-JSON websocket message. conversation_id=%s, raw_message=%s",
+                        trace_id,
+                        conversation_id,
+                        raw_message[:300],
+                    )
+                    continue
+
+                if not isinstance(event_payload, dict):
+                    continue
+
+                observed_event_count += 1
+                state_update_key = str(event_payload.get("key") or "").strip()
+                if state_update_key in {"execution_status", "status"}:
+                    execution_status_value = str(event_payload.get("value") or "").strip()
+                    normalized_execution_status = normalize_openhands_execution_status(
+                        execution_status_value
+                    )
+                    if normalized_execution_status in OPENHANDS_TERMINAL_EXECUTION_STATUSES:
+                        terminal_signal = f"{state_update_key}={execution_status_value}"
+                        wait_completed = True
+                        logger.info(
+                            "[OpenHandsHttpApi][_wait_events_websocket][StepComplete] trace_id=%s | "
+                            "Terminal execution status observed on websocket. conversation_id=%s, "
+                            "execution_status=%s, observed_event_count=%d",
+                            trace_id,
+                            conversation_id,
+                            execution_status_value,
+                            observed_event_count,
+                        )
+                        break
+                action = event_payload.get("action")
+                if isinstance(action, dict):
+                    kind = str(action.get("kind") or "").strip()
+                    if kind in self._EVENT_STREAM_TERMINAL_ACTION_KINDS:
+                        terminal_signal = kind
+                        wait_completed = True
+                        logger.info(
+                            "[OpenHandsHttpApi][_wait_events_websocket][StepComplete] trace_id=%s | "
+                            "Terminal action observed on websocket. conversation_id=%s, action_kind=%s, observed_event_count=%d",
+                            trace_id,
+                            conversation_id,
+                            kind,
+                            observed_event_count,
+                        )
+                        break
+                observation = event_payload.get("observation")
+                if isinstance(observation, dict):
+                    kind = str(observation.get("kind") or "").strip()
+                    if kind in ("error", "ErrorObservation"):
+                        terminal_signal = kind
+                        wait_completed = True
+                        logger.warning(
+                            "[OpenHandsHttpApi][_wait_events_websocket][ErrorHandled][ERR:EXTERNAL] trace_id=%s | "
+                            "Error observation observed on websocket. conversation_id=%s, observation_kind=%s, observed_event_count=%d",
+                            trace_id,
+                            conversation_id,
+                            kind,
+                            observed_event_count,
+                        )
+                        break
+        finally:
+            try:
+                if socket is not None:
+                    socket.close()
+            except Exception as cleanup_exc:
+                logger.warning(
+                    "[OpenHandsHttpApi][_wait_events_websocket][ErrorHandled][ERR:UNEXPECTED] trace_id=%s | "
+                    "Websocket cleanup failed after wait. conversation_id=%s, error=%s",
+                    trace_id,
+                    conversation_id,
+                    str(cleanup_exc),
+                )
+
+        state = self.get_conversation(
+            conversation_id,
+            trace_id=trace_id,
+            log_reads=False,
+        )
+        execution_status = str(
+            state.get("execution_status")
+            or state.get("status")
+            or state.get("state", {}).get("execution_status", "")
+        ).upper()
+        normalized = normalize_openhands_execution_status(execution_status)
+        if normalized in OPENHANDS_TERMINAL_EXECUTION_STATUSES:
+            logger.info(
+                "[OpenHandsHttpApi][_wait_events_websocket][StepComplete] trace_id=%s | "
+                "Conversation finished via events websocket. conversation_id=%s, execution_status=%s, "
+                "observed_event_count=%d, terminal_signal=%s",
+                trace_id,
+                conversation_id,
+                execution_status,
+                observed_event_count,
+                terminal_signal,
+            )
+            return state
+
+        if not wait_completed:
+            logger.warning(
+                "[OpenHandsHttpApi][_wait_events_websocket][ErrorHandled][ERR:TIMEOUT] trace_id=%s | "
+                "Events websocket wait timed out. conversation_id=%s, execution_status=%s, observed_event_count=%d",
+                trace_id,
+                conversation_id,
+                execution_status,
+                observed_event_count,
+            )
+        else:
+            logger.warning(
+                "[OpenHandsHttpApi][_wait_events_websocket][DecisionPoint] trace_id=%s | "
+                "Branch: http_polling_fallback. Reason: events websocket wait ended without terminal conversation state. "
+                "conversation_id=%s, execution_status=%s, observed_event_count=%d, terminal_signal=%s",
+                trace_id,
+                conversation_id,
+                execution_status,
+                observed_event_count,
+                terminal_signal,
+            )
+        return None
+
+    # SEM_END orchestrator_v1.openhands_http_api.openhands_http_api._wait_events_websocket:v1
+
+    def _wait_http_polling(
+        self,
+        conversation_id: str,
+        *,
+        trace_id: str,
+    ) -> dict[str, Any]:
+        """HTTP polling fallback (original implementation)."""
         current_monotonic = time.monotonic()
         idle_deadline = current_monotonic + self._timeout_seconds
         poll_attempt = 0
@@ -526,19 +756,11 @@ class OpenHandsHttpApi:
         started_wait_at = current_monotonic
         last_progress_at = current_monotonic
 
-        logger.info(
-            "[OpenHandsHttpApi][wait_until_finished][ContextAnchor] trace_id=%s | "
-            "Waiting for conversation. conversation_id=%s, idle_timeout_seconds=%d",
-            resolved_trace_id,
-            conversation_id,
-            self._timeout_seconds,
-        )
-
         while True:
             poll_attempt += 1
             state = self.get_conversation(
                 conversation_id,
-                trace_id=resolved_trace_id,
+                trace_id=trace_id,
                 log_reads=False,
             )
             execution_status = str(
@@ -560,10 +782,10 @@ class OpenHandsHttpApi:
             )
             if should_log_poll:
                 logger.info(
-                    "[OpenHandsHttpApi][wait_until_finished][DecisionPoint] trace_id=%s | "
+                    "[OpenHandsHttpApi][_wait_http_polling][DecisionPoint] trace_id=%s | "
                     "Branch: poll_status. Reason: conversation_id=%s, execution_status=%s, "
                     "poll_attempt=%d, next_sleep_seconds=%d",
-                    resolved_trace_id,
+                    trace_id,
                     conversation_id,
                     execution_status,
                     poll_attempt,
@@ -585,10 +807,10 @@ class OpenHandsHttpApi:
             normalized_execution_status = normalize_openhands_execution_status(execution_status)
             if normalized_execution_status in OPENHANDS_TERMINAL_EXECUTION_STATUSES:
                 logger.info(
-                    "[OpenHandsHttpApi][wait_until_finished][StepComplete] trace_id=%s | "
+                    "[OpenHandsHttpApi][_wait_http_polling][StepComplete] trace_id=%s | "
                     "Conversation reached terminal state. conversation_id=%s, execution_status=%s, "
                     "poll_attempts=%d",
-                    resolved_trace_id,
+                    trace_id,
                     conversation_id,
                     execution_status,
                     poll_attempt,
@@ -599,10 +821,10 @@ class OpenHandsHttpApi:
                 idle_for_seconds = int(time.monotonic() - last_progress_at)
                 total_wait_seconds = int(time.monotonic() - started_wait_at)
                 logger.error(
-                    "[OpenHandsHttpApi][wait_until_finished][ErrorHandled][ERR:TIMEOUT] trace_id=%s | "
+                    "[OpenHandsHttpApi][_wait_http_polling][ErrorHandled][ERR:TIMEOUT] trace_id=%s | "
                     "Timed out waiting for conversation progress. conversation_id=%s, poll_attempts=%d, "
                     "execution_status=%s, idle_for_seconds=%d, total_wait_seconds=%d",
-                    resolved_trace_id,
+                    trace_id,
                     conversation_id,
                     poll_attempt,
                     execution_status,
@@ -615,6 +837,59 @@ class OpenHandsHttpApi:
 
             time.sleep(sleep_seconds)
             sleep_seconds = min(sleep_seconds * 2, self._max_poll_interval_seconds)
+
+    # SEM_BEGIN orchestrator_v1.openhands_http_api.wait_until_finished:v1
+    # type: METHOD
+    # use_case: Waits for OH conversation completion using the events WebSocket when available, with HTTP polling fallback.
+    # feature:
+    #   - Events WebSocket wait eliminates 5-15s idle polling gaps
+    #   - Automatic fallback to HTTP polling if WebSocket connection fails
+    # pre:
+    #   - conversation_id is not empty
+    # post:
+    #   - returns the latest terminal conversation state from the OpenHands server
+    # invariant:
+    #   - client reuse is preserved
+    # modifies (internal):
+    #   - external.openhands_server
+    # emits (external):
+    #   - external.openhands_server
+    # errors:
+    #   - TimeoutError: idle timeout exceeded without conversation progress
+    # depends:
+    #   - get_conversation
+    #   - websocket-client
+    # sft: wait for an OpenHands conversation using the events websocket with HTTP polling fallback
+    # idempotent: false
+    # logs: query: GET /api/conversations/{id}
+    def wait_until_finished(self, conversation_id: str, *, trace_id: str | None = None) -> dict[str, Any]:
+        resolved_trace_id = ensure_trace_id(trace_id)
+        logger.info(
+            "[OpenHandsHttpApi][wait_until_finished][ContextAnchor] trace_id=%s | "
+            "Waiting for conversation. conversation_id=%s, idle_timeout_seconds=%d",
+            resolved_trace_id,
+            conversation_id,
+            self._timeout_seconds,
+        )
+
+        websocket_result = self._wait_events_websocket(
+            conversation_id,
+            trace_id=resolved_trace_id,
+        )
+        if websocket_result is not None:
+            return websocket_result
+
+        logger.info(
+            "[OpenHandsHttpApi][wait_until_finished][DecisionPoint] trace_id=%s | "
+            "Branch: http_polling_fallback. Reason: events websocket unavailable or non-terminal. "
+            "conversation_id=%s",
+            resolved_trace_id,
+            conversation_id,
+        )
+        return self._wait_http_polling(
+            conversation_id,
+            trace_id=resolved_trace_id,
+        )
 
     # SEM_END orchestrator_v1.openhands_http_api.wait_until_finished:v1
 

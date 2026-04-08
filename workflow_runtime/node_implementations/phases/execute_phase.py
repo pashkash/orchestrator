@@ -14,6 +14,7 @@ from workflow_runtime.graph_compiler.state_schema import (
 )
 from workflow_runtime.graph_compiler.yaml_manifest_parser import PhaseRuntimeConfig
 from workflow_runtime.integrations.observability import ensure_trace_id
+from workflow_runtime.integrations.phase_config_loader import resolve_role_working_directory
 from workflow_runtime.integrations.runtime_logging import get_logger
 from workflow_runtime.integrations.tasks_storage import build_task_artifact_context
 from workflow_runtime.node_implementations.status_aggregation import get_ready_subtasks, has_incomplete_subtasks
@@ -140,6 +141,9 @@ def run_execute_phase(
     plan = _clone_plan(list(state.get("plan", [])))
     outputs = list(state.get("structured_outputs", []))
     execution_errors = list(state.get("execution_errors", []))
+    runtime_step_refs = list(state.get("runtime_step_refs", []))
+    latest_step_ref_by_key = dict(state.get("latest_step_ref_by_key", {}))
+    pending_approval_ref = None
 
     logger.info(
         "[ExecutePhase][run_execute_phase][ContextAnchor] trace_id=%s | "
@@ -183,6 +187,9 @@ def run_execute_phase(
                     "plan": plan,
                     "structured_outputs": outputs,
                     "execution_errors": execution_errors,
+                    "runtime_step_refs": runtime_step_refs,
+                    "latest_step_ref_by_key": latest_step_ref_by_key,
+                    "pending_approval_ref": pending_approval_ref,
                     "active_subtask_id": unresolved_subtasks[0].id,
                     "pending_human_input": {
                         "source_phase": PhaseId.EXECUTE,
@@ -215,6 +222,9 @@ def run_execute_phase(
                         "plan": plan,
                         "structured_outputs": outputs,
                         "execution_errors": execution_errors,
+                        "runtime_step_refs": runtime_step_refs,
+                        "latest_step_ref_by_key": latest_step_ref_by_key,
+                        "pending_approval_ref": pending_approval_ref,
                         "active_subtask_id": None,
                         "pending_human_input": {
                             "source_phase": PhaseId.EXECUTE,
@@ -244,6 +254,9 @@ def run_execute_phase(
                     "plan": plan,
                     "structured_outputs": outputs,
                     "execution_errors": execution_errors,
+                    "runtime_step_refs": runtime_step_refs,
+                    "latest_step_ref_by_key": latest_step_ref_by_key,
+                    "pending_approval_ref": None,
                     "active_subtask_id": None,
                 }
             logger.info(
@@ -260,6 +273,9 @@ def run_execute_phase(
                 "plan": plan,
                 "structured_outputs": outputs,
                 "execution_errors": execution_errors,
+                "runtime_step_refs": runtime_step_refs,
+                "latest_step_ref_by_key": latest_step_ref_by_key,
+                "pending_approval_ref": None,
                 "active_subtask_id": None,
             }
 
@@ -272,6 +288,12 @@ def run_execute_phase(
             task_card_path=state.get("task_card_path"),
             openhands_conversations_dir=state.get("openhands_conversations_dir"),
         )
+        working_dir = resolve_role_working_directory(
+            role_dir=subtask.role,
+            task_worktree_root=state["task_worktree_root"],
+            task_workspace_repos=state.get("task_workspace_repos", {}),
+            role_workspace_repo_map=state.get("role_workspace_repo_map", {}),
+        )
         result = task_unit_runner.run(
             phase_id=PhaseId.EXECUTE,
             role_dir=subtask.role,
@@ -281,7 +303,11 @@ def run_execute_phase(
                 "user_request": state.get("user_request"),
                 "current_state": state.get("current_state", {}),
                 "source_workspace_root": state.get("workspace_root", ""),
+                "source_workspace_roots": state.get("source_workspace_roots", {}),
+                "primary_workspace_repo_id": state.get("primary_workspace_repo_id", ""),
                 "task_worktree_root": state.get("task_worktree_root", ""),
+                "task_workspace_repos": state.get("task_workspace_repos", {}),
+                "role_workspace_repo_map": state.get("role_workspace_repo_map", {}),
                 "methodology_root_runtime": state.get("methodology_root_runtime", ""),
                 "methodology_agents_entrypoint": state.get("methodology_agents_entrypoint", ""),
                 "subtask_id": subtask.id,
@@ -289,7 +315,7 @@ def run_execute_phase(
                 "dependencies": subtask.dependencies,
                 **task_artifact_context,
             },
-            working_dir=state["task_worktree_root"],
+            working_dir=working_dir,
             metadata={
                 "task_id": state.get("task_id"),
                 "phase": PhaseId.EXECUTE,
@@ -298,6 +324,9 @@ def run_execute_phase(
             },
             trace_id=trace_id,
         )
+        runtime_step_refs.extend(result.runtime_step_refs)
+        latest_step_ref_by_key.update(result.latest_step_ref_by_key)
+        pending_approval_ref = result.pending_approval_ref
 
         subtask.retry_count += max(1, result.executor_attempts_used)
         if result.status == PipelineStatus.PASS and result.structured_output is not None:
@@ -341,6 +370,9 @@ def run_execute_phase(
                 "plan": plan,
                 "structured_outputs": outputs,
                 "execution_errors": execution_errors,
+                "runtime_step_refs": runtime_step_refs,
+                "latest_step_ref_by_key": latest_step_ref_by_key,
+                "pending_approval_ref": pending_approval_ref,
                 "active_subtask_id": subtask.id,
                 "pending_human_input": result.human_question
                 or {
@@ -390,6 +422,9 @@ def run_execute_phase(
             "plan": plan,
             "structured_outputs": outputs,
             "execution_errors": execution_errors,
+            "runtime_step_refs": runtime_step_refs,
+            "latest_step_ref_by_key": latest_step_ref_by_key,
+            "pending_approval_ref": pending_approval_ref if exhausted_retries else None,
             "active_subtask_id": subtask.id,
         }
         if exhausted_retries:
